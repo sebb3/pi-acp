@@ -49,6 +49,7 @@ type PiRpcCommand =
   | { type: 'switch_session'; id?: string; sessionPath: string }
   // Messages
   | { type: 'get_messages'; id?: string }
+  | { type: 'get_last_assistant_text'; id?: string }
   // Commands
   | { type: 'get_commands'; id?: string }
 
@@ -69,6 +70,8 @@ type SpawnParams = {
   piCommand?: string
   /** If set, pi will persist the session to this exact file (via `--session <path>`). */
   sessionPath?: string
+  /** If true, run pi without creating or attaching to a persisted session. */
+  noSession?: boolean
 }
 
 export class PiRpcProcess {
@@ -130,7 +133,8 @@ export class PiRpcProcess {
     // Keep extensions + prompt templates enabled because ACP users may rely on them
     // (e.g. MCP extensions, prompt templates for workflows).
     const args = ['--mode', 'rpc', '--no-themes']
-    if (params.sessionPath) args.push('--session', params.sessionPath)
+    if (params.noSession) args.push('--no-session')
+    else if (params.sessionPath) args.push('--session', params.sessionPath)
 
     const child = spawn(cmd, args, {
       cwd: params.cwd,
@@ -185,16 +189,18 @@ export class PiRpcProcess {
     // Important: pi may emit a get_state response pointing at a sessionFile in a directory
     // that is created lazily. Create the parent dir up-front to avoid later parse errors
     // when we call commands like export_html.
-    try {
-      const state = (await proc.getState()) as any
-      const sessionFile = typeof state?.sessionFile === 'string' ? state.sessionFile : null
-      if (sessionFile) {
-        const { mkdirSync } = await import('node:fs')
-        const { dirname } = await import('node:path')
-        mkdirSync(dirname(sessionFile), { recursive: true })
+    if (!params.noSession) {
+      try {
+        const state = (await proc.getState()) as any
+        const sessionFile = typeof state?.sessionFile === 'string' ? state.sessionFile : null
+        if (sessionFile) {
+          const { mkdirSync } = await import('node:fs')
+          const { dirname } = await import('node:path')
+          mkdirSync(dirname(sessionFile), { recursive: true })
+        }
+      } catch {
+        // ignore for now
       }
-    } catch {
-      // ignore for now
     }
 
     return proc
@@ -306,6 +312,12 @@ export class PiRpcProcess {
     const res = await this.request({ type: 'get_messages' })
     if (!res.success) throw new Error(`pi get_messages failed: ${res.error ?? JSON.stringify(res.data)}`)
     return res.data
+  }
+
+  async getLastAssistantText(): Promise<string> {
+    const res = await this.request({ type: 'get_last_assistant_text' })
+    if (!res.success) throw new Error(`pi get_last_assistant_text failed: ${res.error ?? JSON.stringify(res.data)}`)
+    return String((res.data as any)?.text ?? res.data ?? '')
   }
 
   async getCommands(): Promise<unknown> {

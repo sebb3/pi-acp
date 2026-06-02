@@ -33,6 +33,7 @@ type PendingTurn = {
 
 type QueuedTurn = {
   message: string
+  originalMessage: string
   images: unknown[]
   resolve: (reason: StopReason) => void
   reject: (err: unknown) => void
@@ -138,7 +139,8 @@ export class SessionManager {
       mcpServers: params.mcpServers,
       proc,
       conn: params.conn,
-      fileCommands: params.fileCommands ?? []
+      fileCommands: params.fileCommands ?? [],
+      piCommand: params.piCommand
     })
 
     this.sessions.set(sessionId, session)
@@ -165,7 +167,8 @@ export class SessionManager {
       mcpServers: params.mcpServers,
       proc: params.proc,
       conn: params.conn,
-      fileCommands: params.fileCommands ?? []
+      fileCommands: params.fileCommands ?? [],
+      piCommand: params.piCommand
     })
 
     this.sessions.set(sessionId, session)
@@ -185,6 +188,7 @@ export class PiAcpSession {
   readonly proc: PiRpcProcess
   private readonly conn: AgentSideConnection
   private readonly fileCommands: FileSlashCommand[]
+  private readonly piCommand?: string
 
   // Used to map abort semantics to ACP stopReason.
   // Applies to the currently running turn.
@@ -201,6 +205,8 @@ export class PiAcpSession {
   // pi can emit multiple `turn_end` events for a single user prompt (e.g. after tool_use).
   // The overall agent loop completes when `agent_end` is emitted.
   private inAgentLoop = false
+  private completedTurnCount = 0
+  private firstUserMessage: string | null = null
 
   // For ACP diff support: capture file contents before edits, then emit ToolCallContent {type:"diff"}.
   // This is due to pi sending diff as a string as opposed to ACP expected diff format.
@@ -218,6 +224,7 @@ export class PiAcpSession {
     proc: PiRpcProcess
     conn: AgentSideConnection
     fileCommands?: FileSlashCommand[]
+    piCommand?: string
   }) {
     this.sessionId = opts.sessionId
     this.cwd = opts.cwd
@@ -225,6 +232,7 @@ export class PiAcpSession {
     this.proc = opts.proc
     this.conn = opts.conn
     this.fileCommands = opts.fileCommands ?? []
+    this.piCommand = opts.piCommand
 
     this.proc.onEvent(ev => this.handlePiEvent(ev))
   }
@@ -269,7 +277,7 @@ export class PiAcpSession {
     const expandedMessage = expandSlashCommand(message, this.fileCommands)
 
     const turnPromise = new Promise<StopReason>((resolve, reject) => {
-      const queued: QueuedTurn = { message: expandedMessage, images, resolve, reject }
+      const queued: QueuedTurn = { message: expandedMessage, originalMessage: message, images, resolve, reject }
 
       // If a turn is already running, enqueue.
       if (this.pendingTurn) {
@@ -350,6 +358,7 @@ export class PiAcpSession {
   private startTurn(t: QueuedTurn): void {
     this.cancelRequested = false
     this.inAgentLoop = false
+    if (this.completedTurnCount === 0 && this.firstUserMessage === null) this.firstUserMessage = t.originalMessage
 
     this.pendingTurn = { resolve: t.resolve, reject: t.reject }
 
@@ -387,6 +396,48 @@ export class PiAcpSession {
       })
       void err
     })
+  }
+
+  private maybeAutoNameAfterFirstTurn(): void {
+    void this.autoNameAfterFirstTurn().catch(() => {
+      // Naming is best-effort; never affect the active prompt flow.
+    })
+  }
+
+  private async autoNameAfterFirstTurn(): Promise<void> {
+    const userMessage = this.firstUserMessage?.trim()
+    if (!userMessage) return
+
+    const assistantText = (await this.proc.getLastAssistantText()).trim()
+    if (!assistantText) return
+
+    const initialState = (await this.proc.getState()) as any
+    if (hasSessionName(initialState)) return
+
+    const titleProc = await PiRpcProcess.spawn({
+      cwd: this.cwd,
+      piCommand: this.piCommand,
+      noSession: true
+    })
+
+    try {
+      await titleProc.setModel('openai-codex', 'gpt-5.4-mini')
+      const rawTitle = await promptForTitle(titleProc, buildTitlePrompt(userMessage, assistantText))
+      const title = sanitizeGeneratedTitle(rawTitle)
+      if (!title) return
+
+      const state = (await this.proc.getState()) as any
+      if (hasSessionName(state)) return
+
+      await this.proc.setSessionName(title)
+      this.emit({
+        sessionUpdate: 'session_info_update',
+        title,
+        updatedAt: new Date().toISOString()
+      })
+    } finally {
+      titleProc.dispose()
+    }
   }
 
   private handlePiEvent(ev: PiRpcEvent) {
@@ -650,6 +701,9 @@ export class PiAcpSession {
         // the ACP `session/prompt` request.
         void this.flushEmits().finally(() => {
           const reason: StopReason = this.cancelRequested ? 'cancelled' : 'end_turn'
+          const shouldAutoName = reason === 'end_turn' && this.completedTurnCount === 0
+          this.completedTurnCount += 1
+
           this.pendingTurn?.resolve(reason)
           this.pendingTurn = null
           this.inAgentLoop = false
@@ -668,6 +722,8 @@ export class PiAcpSession {
               _meta: { piAcp: { queueDepth: 0, running: false } }
             })
           }
+
+          if (shouldAutoName) this.maybeAutoNameAfterFirstTurn()
         })
         break
       }
@@ -676,6 +732,80 @@ export class PiAcpSession {
         break
     }
   }
+}
+
+async function promptForTitle(proc: PiRpcProcess, prompt: string): Promise<string> {
+  let off = () => {}
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  const agentEnd = new Promise<void>((resolve, reject) => {
+    timeout = setTimeout(() => reject(new Error('Timed out waiting for title generation')), 30_000)
+    off = proc.onEvent(ev => {
+      if (String((ev as any).type ?? '') === 'agent_end') {
+        off()
+        off = () => {}
+        resolve()
+      }
+    })
+  })
+
+  try {
+    await proc.prompt(prompt, [])
+    await agentEnd
+    return await proc.getLastAssistantText()
+  } finally {
+    off()
+    if (timeout) clearTimeout(timeout)
+  }
+}
+
+function buildTitlePrompt(userMessage: string, assistantText: string): string {
+  return [
+    'Generate a concise title for this coding-agent session.',
+    'Return only the title, with no quotes, markdown, or explanation.',
+    'Keep it under 8 words.',
+    '',
+    'First user message:',
+    trimForTitlePrompt(userMessage),
+    '',
+    'First assistant response:',
+    trimForTitlePrompt(assistantText)
+  ].join('\n')
+}
+
+function trimForTitlePrompt(text: string): string {
+  const normalized = text.replace(/\s+/g, ' ').trim()
+  return normalized.length > 6000 ? `${normalized.slice(0, 6000).trim()}…` : normalized
+}
+
+function sanitizeGeneratedTitle(raw: string): string | null {
+  let title =
+    raw
+      .split(/\r?\n/)
+      .map(line => stripTitleControlChars(line).trim())
+      .find(line => line.length > 0) ?? ''
+  title = title.replace(/^title\s*:\s*/i, '').trim()
+  title = title
+    .replace(/^[-*#]\s+/, '')
+    .replace(/^\d+[.)]\s+/, '')
+    .trim()
+  title = title.replace(/^["'`“”‘’]+|["'`“”‘’]+$/g, '').trim()
+  title = title.replace(/\s+/g, ' ').trim()
+  if (!title) return null
+  return title.length > 80 ? title.slice(0, 80).trim() : title
+}
+
+function stripTitleControlChars(text: string): string {
+  return Array.from(text, ch => {
+    const code = ch.charCodeAt(0)
+    return (code >= 0 && code <= 8) || code === 11 || code === 12 || (code >= 14 && code <= 31) || code === 127
+      ? ' '
+      : ch
+  }).join('')
+}
+
+function hasSessionName(state: unknown): boolean {
+  const sessionName = (state as any)?.sessionName
+  return typeof sessionName === 'string' && sessionName.trim().length > 0
 }
 
 function formatAutoRetryMessage(ev: PiRpcEvent): string {

@@ -866,7 +866,8 @@ export class PiAcpAgent implements ACPAgent {
       mcpServers: params.mcpServers,
       conn: this.conn,
       proc,
-      fileCommands
+      fileCommands,
+      piCommand: process.env.PI_ACP_PI_COMMAND
     })
 
     // Policy: within a single ACP connection (one Zed window), keep only one live pi subprocess.
