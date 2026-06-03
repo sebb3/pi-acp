@@ -20,7 +20,7 @@ import {
   type StopReason
 } from '@agentclientprotocol/sdk'
 import { getAuthMethods } from './auth.js'
-import { SessionManager } from './session.js'
+import { SessionManager, type PiAcpSession } from './session.js'
 import { SessionStore } from './session-store.js'
 import { PiRpcProcess } from '../pi-rpc/process.js'
 import { listPiSessions, findPiSessionFile } from './pi-sessions.js'
@@ -132,6 +132,75 @@ export class PiAcpAgent implements ACPAgent {
     }
 
     this.store.delete(sessionId)
+  }
+
+  private getSessionIfPresent(sessionId: string): PiAcpSession | null {
+    const maybeGet = (this.sessions as any).maybeGet
+    if (typeof maybeGet === 'function')
+      return (maybeGet.call(this.sessions, sessionId) as PiAcpSession | undefined) ?? null
+
+    try {
+      return this.sessions.get(sessionId)
+    } catch {
+      return null
+    }
+  }
+
+  private async spawnPiSession(cwd: string, sessionFile: string): Promise<PiRpcProcess> {
+    try {
+      return await PiRpcProcess.spawn({
+        cwd,
+        sessionPath: sessionFile,
+        piCommand: process.env.PI_ACP_PI_COMMAND
+      })
+    } catch (e: any) {
+      if (e?.name === 'PiRpcSpawnError') {
+        throw RequestError.internalError({ code: e?.code }, String(e?.message ?? e))
+      }
+      throw e
+    }
+  }
+
+  private resolveKnownSession(sessionId: string, cwdHint?: string): { cwd: string; sessionFile: string } | null {
+    const stored = this.store.get(sessionId)
+    if (stored?.sessionFile) {
+      const cwd = cwdHint ?? stored.cwd
+      if (typeof cwd === 'string' && cwd.trim()) return { cwd, sessionFile: stored.sessionFile }
+    }
+
+    const sessionFile = findPiSessionFile(sessionId)
+    if (!sessionFile) return null
+
+    const piSession = listPiSessions().find(s => s.sessionId === sessionId && s.sessionFile === sessionFile)
+    const cwd = cwdHint ?? piSession?.cwd
+    if (typeof cwd !== 'string' || !cwd.trim()) return null
+
+    return { cwd, sessionFile }
+  }
+
+  private async getOrReviveSession(
+    sessionId: string,
+    opts: { cwd?: string; mcpServers?: any[] } = {}
+  ): Promise<PiAcpSession> {
+    const existing = this.getSessionIfPresent(sessionId)
+    if (existing) return existing
+
+    const known = this.resolveKnownSession(sessionId, opts.cwd)
+    if (!known) throw RequestError.invalidParams(`Unknown sessionId: ${sessionId}`)
+    if (!isAbsolute(known.cwd)) throw RequestError.invalidParams(`cwd must be an absolute path: ${known.cwd}`)
+
+    const proc = await this.spawnPiSession(known.cwd, known.sessionFile)
+    const session = this.sessions.getOrCreate(sessionId, {
+      cwd: known.cwd,
+      mcpServers: (opts.mcpServers ?? []) as any,
+      conn: this.conn,
+      proc,
+      fileCommands: loadSlashCommands(known.cwd),
+      piCommand: process.env.PI_ACP_PI_COMMAND
+    })
+
+    this.store.upsert({ sessionId, cwd: known.cwd, sessionFile: known.sessionFile })
+    return session
   }
 
   async initialize(params: InitializeRequest): Promise<InitializeResponse> {
@@ -263,15 +332,7 @@ export class PiAcpAgent implements ACPAgent {
           updateNotice
         })
 
-    if (preludeText)
-      session.setStartupInfo(preludeText)
-
-      // Policy: within a single ACP connection (one client window), keep only one live pi subprocess.
-      // This avoids leaking subprocesses when clients start new sessions but don't explicitly close old ones.
-      // It does NOT affect other client windows because they run in separate agent processes.
-      //
-      // (Tests sometimes stub out `this.sessions`, so guard the call.)
-    ;(this.sessions as any).closeAllExcept?.(session.sessionId)
+    if (preludeText) session.setStartupInfo(preludeText)
 
     const response = {
       sessionId: session.sessionId,
@@ -332,7 +393,7 @@ export class PiAcpAgent implements ACPAgent {
   }
 
   async prompt(params: PromptRequest): Promise<PromptResponse> {
-    const session = this.sessions.get(params.sessionId)
+    const session = await this.getOrReviveSession(params.sessionId)
 
     const { message, images } = promptToPiMessage(params.prompt)
 
@@ -789,7 +850,7 @@ export class PiAcpAgent implements ACPAgent {
   }
 
   async cancel(params: CancelNotification): Promise<void> {
-    const session = this.sessions.get(params.sessionId)
+    const session = await this.getOrReviveSession(params.sessionId)
     await session.cancel()
   }
 
@@ -827,59 +888,15 @@ export class PiAcpAgent implements ACPAgent {
       throw RequestError.invalidParams(`cwd must be an absolute path: ${params.cwd}`)
     }
 
-    // If the client is re-loading a session that is already active, tear down the existing
-    // pi subprocess so we can start fresh and re-advertise commands reliably.
-    // (Some clients may call session/load when restoring from history.)
-    this.sessions.close(params.sessionId)
-
     this.lastSessionCwd = params.cwd
 
-    // MVP: ignore mcpServers.
-    // Prefer ACP-created mapping first (fast path), otherwise scan pi sessions dir.
-    const stored = this.store.get(params.sessionId)
-    const sessionFile = stored?.sessionFile ?? findPiSessionFile(params.sessionId)
-
-    if (!sessionFile) {
-      throw RequestError.invalidParams(`Unknown sessionId: ${params.sessionId}`)
-    }
-
-    // Spawn pi and point it directly at the session file.
-    let proc: PiRpcProcess
-    try {
-      proc = await PiRpcProcess.spawn({
-        cwd: params.cwd,
-        sessionPath: sessionFile,
-        piCommand: process.env.PI_ACP_PI_COMMAND
-      })
-    } catch (e: any) {
-      if (e?.name === 'PiRpcSpawnError') {
-        throw RequestError.internalError({ code: e?.code }, String(e?.message ?? e))
-      }
-      throw e
-    }
-
+    const session = await this.getOrReviveSession(params.sessionId, {
+      cwd: params.cwd,
+      mcpServers: params.mcpServers
+    })
+    const proc = session.proc
     const fileCommands = loadSlashCommands(params.cwd)
     const enableSkillCommands = getEnableSkillCommands(params.cwd)
-
-    const session = this.sessions.getOrCreate(params.sessionId, {
-      cwd: params.cwd,
-      mcpServers: params.mcpServers,
-      conn: this.conn,
-      proc,
-      fileCommands,
-      piCommand: process.env.PI_ACP_PI_COMMAND
-    })
-
-    // Policy: within a single ACP connection (one Zed window), keep only one live pi subprocess.
-    // (Tests sometimes stub out `this.sessions`, so guard the call.)
-    ;(this.sessions as any).closeAllExcept?.(session.sessionId)
-
-    // (Optional) ensure mapping stays fresh.
-    this.store.upsert({
-      sessionId: params.sessionId,
-      cwd: params.cwd,
-      sessionFile
-    })
 
     // Replay full conversation history.
     const data = (await proc.getMessages()) as any
@@ -996,7 +1013,7 @@ export class PiAcpAgent implements ACPAgent {
   }
 
   async unstable_setSessionModel(params: { sessionId: string; modelId: string }): Promise<void> {
-    const session = this.sessions.get(params.sessionId)
+    const session = await this.getOrReviveSession(params.sessionId)
 
     // Accept either:
     //  - "provider/model" (preferred, matches how we advertise)
@@ -1030,12 +1047,12 @@ export class PiAcpAgent implements ACPAgent {
   }
 
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
-    const session = this.sessions.get(params.sessionId)
-
     const mode = String(params.modeId)
     if (!isThinkingLevel(mode)) {
       throw RequestError.invalidParams(`Unknown modeId: ${mode}`)
     }
+
+    const session = await this.getOrReviveSession(params.sessionId)
 
     await session.proc.setThinkingLevel(mode)
 

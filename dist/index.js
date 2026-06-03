@@ -1650,6 +1650,61 @@ var PiAcpAgent = class {
     }
     this.store.delete(sessionId);
   }
+  getSessionIfPresent(sessionId) {
+    const maybeGet = this.sessions.maybeGet;
+    if (typeof maybeGet === "function")
+      return maybeGet.call(this.sessions, sessionId) ?? null;
+    try {
+      return this.sessions.get(sessionId);
+    } catch {
+      return null;
+    }
+  }
+  async spawnPiSession(cwd, sessionFile) {
+    try {
+      return await PiRpcProcess.spawn({
+        cwd,
+        sessionPath: sessionFile,
+        piCommand: process.env.PI_ACP_PI_COMMAND
+      });
+    } catch (e) {
+      if (e?.name === "PiRpcSpawnError") {
+        throw RequestError3.internalError({ code: e?.code }, String(e?.message ?? e));
+      }
+      throw e;
+    }
+  }
+  resolveKnownSession(sessionId, cwdHint) {
+    const stored = this.store.get(sessionId);
+    if (stored?.sessionFile) {
+      const cwd2 = cwdHint ?? stored.cwd;
+      if (typeof cwd2 === "string" && cwd2.trim()) return { cwd: cwd2, sessionFile: stored.sessionFile };
+    }
+    const sessionFile = findPiSessionFile(sessionId);
+    if (!sessionFile) return null;
+    const piSession = listPiSessions().find((s) => s.sessionId === sessionId && s.sessionFile === sessionFile);
+    const cwd = cwdHint ?? piSession?.cwd;
+    if (typeof cwd !== "string" || !cwd.trim()) return null;
+    return { cwd, sessionFile };
+  }
+  async getOrReviveSession(sessionId, opts = {}) {
+    const existing = this.getSessionIfPresent(sessionId);
+    if (existing) return existing;
+    const known = this.resolveKnownSession(sessionId, opts.cwd);
+    if (!known) throw RequestError3.invalidParams(`Unknown sessionId: ${sessionId}`);
+    if (!isAbsolute3(known.cwd)) throw RequestError3.invalidParams(`cwd must be an absolute path: ${known.cwd}`);
+    const proc = await this.spawnPiSession(known.cwd, known.sessionFile);
+    const session = this.sessions.getOrCreate(sessionId, {
+      cwd: known.cwd,
+      mcpServers: opts.mcpServers ?? [],
+      conn: this.conn,
+      proc,
+      fileCommands: loadSlashCommands(known.cwd),
+      piCommand: process.env.PI_ACP_PI_COMMAND
+    });
+    this.store.upsert({ sessionId, cwd: known.cwd, sessionFile: known.sessionFile });
+    return session;
+  }
   async initialize(params) {
     const supportedVersion = 1;
     const requested = params.protocolVersion;
@@ -1746,9 +1801,7 @@ var PiAcpAgent = class {
       fileCommands,
       updateNotice
     });
-    if (preludeText)
-      session.setStartupInfo(preludeText);
-    this.sessions.closeAllExcept?.(session.sessionId);
+    if (preludeText) session.setStartupInfo(preludeText);
     const response = {
       sessionId: session.sessionId,
       models,
@@ -1793,7 +1846,7 @@ var PiAcpAgent = class {
     return;
   }
   async prompt(params) {
-    const session = this.sessions.get(params.sessionId);
+    const session = await this.getOrReviveSession(params.sessionId);
     const { message, images } = promptToPiMessage(params.prompt);
     if (images.length === 0 && message.trimStart().startsWith("/")) {
       const trimmed = message.trim();
@@ -2166,7 +2219,7 @@ ${JSON.stringify(stats, null, 2)}`;
     return { stopReason };
   }
   async cancel(params) {
-    const session = this.sessions.get(params.sessionId);
+    const session = await this.getOrReviveSession(params.sessionId);
     await session.cancel();
   }
   async unstable_listSessions(params) {
@@ -2190,42 +2243,14 @@ ${JSON.stringify(stats, null, 2)}`;
     if (!isAbsolute3(params.cwd)) {
       throw RequestError3.invalidParams(`cwd must be an absolute path: ${params.cwd}`);
     }
-    this.sessions.close(params.sessionId);
     this.lastSessionCwd = params.cwd;
-    const stored = this.store.get(params.sessionId);
-    const sessionFile = stored?.sessionFile ?? findPiSessionFile(params.sessionId);
-    if (!sessionFile) {
-      throw RequestError3.invalidParams(`Unknown sessionId: ${params.sessionId}`);
-    }
-    let proc;
-    try {
-      proc = await PiRpcProcess.spawn({
-        cwd: params.cwd,
-        sessionPath: sessionFile,
-        piCommand: process.env.PI_ACP_PI_COMMAND
-      });
-    } catch (e) {
-      if (e?.name === "PiRpcSpawnError") {
-        throw RequestError3.internalError({ code: e?.code }, String(e?.message ?? e));
-      }
-      throw e;
-    }
+    const session = await this.getOrReviveSession(params.sessionId, {
+      cwd: params.cwd,
+      mcpServers: params.mcpServers
+    });
+    const proc = session.proc;
     const fileCommands = loadSlashCommands(params.cwd);
     const enableSkillCommands = getEnableSkillCommands(params.cwd);
-    const session = this.sessions.getOrCreate(params.sessionId, {
-      cwd: params.cwd,
-      mcpServers: params.mcpServers,
-      conn: this.conn,
-      proc,
-      fileCommands,
-      piCommand: process.env.PI_ACP_PI_COMMAND
-    });
-    this.sessions.closeAllExcept?.(session.sessionId);
-    this.store.upsert({
-      sessionId: params.sessionId,
-      cwd: params.cwd,
-      sessionFile
-    });
     const data = await proc.getMessages();
     const messages = Array.isArray(data?.messages) ? data.messages : [];
     for (const m of messages) {
@@ -2324,7 +2349,7 @@ ${JSON.stringify(stats, null, 2)}`;
     return response;
   }
   async unstable_setSessionModel(params) {
-    const session = this.sessions.get(params.sessionId);
+    const session = await this.getOrReviveSession(params.sessionId);
     let provider = null;
     let modelId = null;
     if (params.modelId.includes("/")) {
@@ -2349,11 +2374,11 @@ ${JSON.stringify(stats, null, 2)}`;
     await session.proc.setModel(provider, modelId);
   }
   async setSessionMode(params) {
-    const session = this.sessions.get(params.sessionId);
     const mode = String(params.modeId);
     if (!isThinkingLevel(mode)) {
       throw RequestError3.invalidParams(`Unknown modeId: ${mode}`);
     }
+    const session = await this.getOrReviveSession(params.sessionId);
     await session.proc.setThinkingLevel(mode);
     void this.conn.sessionUpdate({
       sessionId: session.sessionId,
