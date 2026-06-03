@@ -79,7 +79,8 @@ function maybeAuthRequiredError(err) {
 
 // src/acp/session.ts
 import { readFileSync as readFileSync3 } from "fs";
-import { isAbsolute, resolve as resolvePath } from "path";
+import { extname, isAbsolute, resolve as resolvePath } from "path";
+import { pathToFileURL } from "url";
 
 // src/pi-rpc/process.ts
 import { spawn } from "child_process";
@@ -613,6 +614,57 @@ function findUniqueLineNumber(text, needle) {
   }
   return line;
 }
+function readMimeType(path) {
+  switch (extname(path).toLowerCase()) {
+    case ".md":
+    case ".markdown":
+      return "text/markdown";
+    case ".json":
+      return "application/json";
+    case ".jsonl":
+      return "application/x-ndjson";
+    case ".html":
+    case ".htm":
+      return "text/html";
+    case ".css":
+      return "text/css";
+    case ".js":
+    case ".mjs":
+    case ".cjs":
+      return "text/javascript";
+    case ".ts":
+    case ".mts":
+    case ".cts":
+      return "text/typescript";
+    case ".tsx":
+      return "text/tsx";
+    case ".jsx":
+      return "text/jsx";
+    case ".yaml":
+    case ".yml":
+      return "application/yaml";
+    case ".xml":
+      return "application/xml";
+    default:
+      return "text/plain";
+  }
+}
+function readResourceContent(path, cwd, text) {
+  const absPath = isAbsolute(path) ? path : resolvePath(cwd, path);
+  return [
+    {
+      type: "content",
+      content: {
+        type: "resource",
+        resource: {
+          uri: pathToFileURL(absPath).toString(),
+          mimeType: readMimeType(absPath),
+          text
+        }
+      }
+    }
+  ];
+}
 function toToolCallLocations(args, cwd, line) {
   const path = typeof args?.path === "string" ? args.path : void 0;
   if (!path) return void 0;
@@ -741,6 +793,7 @@ var PiAcpSession = class {
   // This is due to pi sending diff as a string as opposed to ACP expected diff format.
   // Compatible format may need to be implemented in pi in the future.
   editSnapshots = /* @__PURE__ */ new Map();
+  readSnapshots = /* @__PURE__ */ new Map();
   bashToolCallIds = /* @__PURE__ */ new Set();
   bashOutputSnapshots = /* @__PURE__ */ new Map();
   // Ensure `session/update` notifications are sent in order and can be awaited
@@ -868,6 +921,7 @@ var PiAcpSession = class {
   cleanupToolCall(toolCallId) {
     this.currentToolCalls.delete(toolCallId);
     this.editSnapshots.delete(toolCallId);
+    this.readSnapshots.delete(toolCallId);
     this.bashToolCallIds.delete(toolCallId);
     this.bashOutputSnapshots.delete(toolCallId);
   }
@@ -1028,6 +1082,10 @@ var PiAcpSession = class {
           });
           break;
         }
+        if (toolName === "read") {
+          const p = typeof args?.path === "string" ? args.path : void 0;
+          if (p) this.readSnapshots.set(toolCallId, { path: p });
+        }
         if (toolName === "edit") {
           const p = typeof args?.path === "string" ? args.path : void 0;
           if (p) {
@@ -1101,6 +1159,10 @@ var PiAcpSession = class {
         const text = toolResultToText(result);
         const snapshot = this.editSnapshots.get(toolCallId);
         let content;
+        const readSnapshot = this.readSnapshots.get(toolCallId);
+        if (!isError && readSnapshot && text) {
+          content = readResourceContent(readSnapshot.path, this.cwd, text);
+        }
         if (!isError && snapshot) {
           try {
             const abs = isAbsolute(snapshot.path) ? snapshot.path : resolvePath(this.cwd, snapshot.path);
