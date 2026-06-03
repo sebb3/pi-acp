@@ -189,6 +189,88 @@ test('AgentSessionProcess: keeps native read when the client does not advertise 
   assert.equal(fakeSession.agent.state.tools[0]!.source, 'builtin')
 })
 
+test('PiAcpAgent: in-process AgentSession backend maps representative tool lifecycle events', async () => {
+  const conn = new FakeAgentSideConnection()
+  const fakeSession = new FakeAgentSession()
+  const sessions = new SessionManager({
+    async spawnProcess() {
+      return new AgentSessionProcess(fakeSession)
+    }
+  })
+  const agent = new PiAcpAgent(asAgentConn(conn), { sessionManager: sessions })
+
+  await agent.newSession({ cwd: process.cwd(), mcpServers: [] } as any)
+  fakeSession.emit({ type: 'tool_execution_start', toolCallId: 'read-1', toolName: 'read', args: { path: 'package.json' } })
+  fakeSession.emit({
+    type: 'tool_execution_update',
+    toolCallId: 'read-1',
+    partialResult: { content: [{ type: 'text', text: 'reading' }] }
+  })
+  fakeSession.emit({
+    type: 'tool_execution_end',
+    toolCallId: 'read-1',
+    isError: false,
+    result: { content: [{ type: 'text', text: 'done' }] }
+  })
+
+  await new Promise(resolve => setTimeout(resolve, 0))
+  const toolUpdates = conn.updates.map(u => u.update as any).filter(u => u.toolCallId === 'read-1')
+
+  assert.equal(toolUpdates.length, 3)
+  assert.deepEqual(toolUpdates[0], {
+    sessionUpdate: 'tool_call',
+    toolCallId: 'read-1',
+    title: 'read',
+    kind: 'read',
+    status: 'in_progress',
+    locations: [{ path: `${process.cwd()}/package.json` }],
+    rawInput: { path: 'package.json' }
+  })
+  assert.equal(toolUpdates[1].sessionUpdate, 'tool_call_update')
+  assert.equal(toolUpdates[1].status, 'in_progress')
+  assert.deepEqual(toolUpdates[1].content, [{ type: 'content', content: { type: 'text', text: 'reading' } }])
+  assert.equal(toolUpdates[2].sessionUpdate, 'tool_call_update')
+  assert.equal(toolUpdates[2].status, 'completed')
+  assert.deepEqual(toolUpdates[2].content, [{ type: 'content', content: { type: 'text', text: 'done' } }])
+})
+
+test('PiAcpAgent: in-process AgentSession backend keeps bash terminal-style ACP cards', async () => {
+  const conn = new FakeAgentSideConnection()
+  const fakeSession = new FakeAgentSession()
+  const sessions = new SessionManager({
+    async spawnProcess() {
+      return new AgentSessionProcess(fakeSession)
+    }
+  })
+  const agent = new PiAcpAgent(asAgentConn(conn), { sessionManager: sessions })
+
+  await agent.newSession({ cwd: process.cwd(), mcpServers: [] } as any)
+  fakeSession.emit({ type: 'tool_execution_start', toolCallId: 'bash-1', toolName: 'bash', args: { command: 'echo hi' } })
+  fakeSession.emit({
+    type: 'tool_execution_update',
+    toolCallId: 'bash-1',
+    partialResult: { content: [{ type: 'text', text: 'hi\\n' }] }
+  })
+  fakeSession.emit({
+    type: 'tool_execution_end',
+    toolCallId: 'bash-1',
+    isError: false,
+    result: { content: [{ type: 'text', text: 'hi\\n' }], details: { exitCode: 0 } }
+  })
+
+  await new Promise(resolve => setTimeout(resolve, 0))
+  const toolUpdates = conn.updates.map(u => u.update as any).filter(u => u.toolCallId === 'bash-1')
+
+  assert.equal(toolUpdates.length, 3)
+  assert.equal(toolUpdates[0].sessionUpdate, 'tool_call')
+  assert.equal(toolUpdates[0].kind, 'execute')
+  assert.equal(toolUpdates[0].title, 'echo hi')
+  assert.deepEqual(toolUpdates[0].content, [{ type: 'terminal', terminalId: 'bash-1' }])
+  assert.deepEqual(toolUpdates[0]._meta, { terminal_info: { terminal_id: 'bash-1', cwd: process.cwd() } })
+  assert.deepEqual(toolUpdates[1]._meta, { terminal_output: { terminal_id: 'bash-1', data: 'hi\\n' } })
+  assert.deepEqual(toolUpdates[2]._meta, { terminal_exit: { terminal_id: 'bash-1', exit_code: 0, signal: null } })
+})
+
 test('PiAcpAgent: in-process AgentSession backend maps cancellation to cancelled stop reason', async () => {
   const conn = new FakeAgentSideConnection()
   const fakeSession = new FakeAgentSession()
