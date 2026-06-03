@@ -355,21 +355,37 @@ var AgentSessionProcess = class _AgentSessionProcess {
     const sdk = deps.createAgentSession ? null : await loadPiSdkModule();
     const createAgentSession = deps.createAgentSession ?? sdk.createAgentSession;
     const createReadToolDefinition = deps.createReadToolDefinition ?? sdk?.createReadToolDefinition;
+    const createWriteToolDefinition = deps.createWriteToolDefinition ?? sdk?.createWriteToolDefinition;
     const sessionManager = params.sessionPath ? sdk?.SessionManager?.open(params.sessionPath, void 0, params.cwd) : void 0;
     const sessionIdRef = { current: "" };
-    const acpReadTool = createReadToolDefinition && shouldUseAcpRead(params) ? createAcpReadToolDefinition({
-      cwd: params.cwd,
-      conn: params.conn,
-      createReadToolDefinition,
-      getSessionId: () => sessionIdRef.current
-    }) : void 0;
+    const customTools = [];
+    if (createReadToolDefinition && shouldUseAcpRead(params)) {
+      customTools.push(
+        createAcpReadToolDefinition({
+          cwd: params.cwd,
+          conn: params.conn,
+          createReadToolDefinition,
+          getSessionId: () => sessionIdRef.current
+        })
+      );
+    }
+    if (createWriteToolDefinition && shouldUseAcpWrite(params)) {
+      customTools.push(
+        createAcpWriteToolDefinition({
+          cwd: params.cwd,
+          conn: params.conn,
+          createWriteToolDefinition,
+          getSessionId: () => sessionIdRef.current
+        })
+      );
+    }
     const result = await createAgentSession({
       cwd: params.cwd,
       ...sessionManager ? { sessionManager } : {},
-      ...acpReadTool ? { customTools: [acpReadTool] } : {}
+      ...customTools.length > 0 ? { customTools } : {}
     });
     sessionIdRef.current = result.session.sessionId ?? "";
-    if (acpReadTool) installAcpReadTool(result.session, acpReadTool);
+    for (const customTool of customTools) installAcpTool(result.session, customTool);
     return new _AgentSessionProcess(result.session);
   }
   onEvent(handler) {
@@ -502,6 +518,9 @@ async function loadPiSdkModule() {
 function shouldUseAcpRead(params) {
   return Boolean(params.conn && params.clientCapabilities?.fs?.readTextFile);
 }
+function shouldUseAcpWrite(params) {
+  return Boolean(params.conn && params.clientCapabilities?.fs?.writeTextFile);
+}
 function createAcpReadToolDefinition(opts) {
   return opts.createReadToolDefinition(opts.cwd, {
     operations: {
@@ -514,16 +533,27 @@ function createAcpReadToolDefinition(opts) {
     }
   });
 }
-function installAcpReadTool(session, acpReadTool) {
+function createAcpWriteToolDefinition(opts) {
+  return opts.createWriteToolDefinition(opts.cwd, {
+    operations: {
+      mkdir: async (_dir) => {
+      },
+      writeFile: async (absolutePath, content) => {
+        await opts.conn.writeTextFile({ sessionId: opts.getSessionId(), path: absolutePath, content });
+      }
+    }
+  });
+}
+function installAcpTool(session, acpTool) {
   const tools = session.agent?.state?.tools;
-  if (!Array.isArray(tools)) return;
+  if (!Array.isArray(tools) || !acpTool.name) return;
   let replaced = false;
   session.agent.state.tools = tools.map((tool) => {
-    if (tool?.name !== "read") return tool;
+    if (tool?.name !== acpTool.name) return tool;
     replaced = true;
-    return acpReadTool;
+    return acpTool;
   });
-  if (!replaced) session.agent.state.tools = [acpReadTool, ...tools];
+  if (!replaced) session.agent.state.tools = [acpTool, ...tools];
 }
 function extractAssistantText(message) {
   const role = message?.role;

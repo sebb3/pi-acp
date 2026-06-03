@@ -19,7 +19,9 @@ class FakeAgentSession {
   readonly followUpMode = 'all'
   readonly autoCompactionEnabled = true
   readonly messages: any[] = []
-  readonly agent = { state: { tools: [{ name: 'read', source: 'builtin' }, { name: 'bash' }] as any[] } }
+  readonly agent = {
+    state: { tools: [{ name: 'read', source: 'builtin' }, { name: 'write', source: 'builtin' }, { name: 'bash' }] as any[] }
+  }
   readonly prompts: Array<{ text: string; options: unknown }> = []
   abortCount = 0
   modelSelections: unknown[] = []
@@ -169,30 +171,70 @@ test('AgentSessionProcess: replaces read with an ACP-backed read tool when the c
   )
 
   assert.equal(fakeSession.agent.state.tools[0]!.source, 'acp')
-  assert.equal(fakeSession.agent.state.tools[1]!.name, 'bash')
+  assert.equal(fakeSession.agent.state.tools[1]!.name, 'write')
+  assert.equal(fakeSession.agent.state.tools[2]!.name, 'bash')
   assert.equal((await readOperations.readFile('/tmp/file.txt')).toString('utf8'), 'from zed fs')
   assert.deepEqual(readRequests, [{ sessionId: 'agent-session-1', path: '/tmp/file.txt' }])
 })
 
-test('AgentSessionProcess: keeps native read when the client does not advertise fs read support', async () => {
+test('AgentSessionProcess: replaces write with an ACP-backed write tool when the client supports it', async () => {
+  const fakeSession = new FakeAgentSession()
+  const writeRequests: any[] = []
+  const conn = {
+    async writeTextFile(params: any) {
+      writeRequests.push(params)
+      return {}
+    }
+  }
+  let writeOperations: any = null
+
+  await AgentSessionProcess.spawn(
+    {
+      cwd: process.cwd(),
+      conn: conn as any,
+      clientCapabilities: { fs: { writeTextFile: true } }
+    },
+    {
+      createAgentSession: async options => {
+        assert.equal((options as any).customTools?.[0]?.source, 'acp')
+        return { session: fakeSession }
+      },
+      createWriteToolDefinition: (_cwd, options) => {
+        writeOperations = options?.operations
+        return { name: 'write', source: 'acp' } as any
+      }
+    }
+  )
+
+  assert.equal(fakeSession.agent.state.tools[0]!.name, 'read')
+  assert.equal(fakeSession.agent.state.tools[1]!.source, 'acp')
+  assert.equal(fakeSession.agent.state.tools[2]!.name, 'bash')
+  await writeOperations.mkdir('/tmp')
+  await writeOperations.writeFile('/tmp/file.txt', 'hello from acp')
+  assert.deepEqual(writeRequests, [{ sessionId: 'agent-session-1', path: '/tmp/file.txt', content: 'hello from acp' }])
+})
+
+test('AgentSessionProcess: keeps native read/write when the client does not advertise fs support', async () => {
   const fakeSession = new FakeAgentSession()
 
   await AgentSessionProcess.spawn(
     {
       cwd: process.cwd(),
       conn: {} as any,
-      clientCapabilities: { fs: { readTextFile: false } }
+      clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } }
     },
     {
       createAgentSession: async options => {
         assert.equal((options as any).customTools, undefined)
         return { session: fakeSession }
       },
-      createReadToolDefinition: () => ({ name: 'read', source: 'acp' }) as any
+      createReadToolDefinition: () => ({ name: 'read', source: 'acp' }) as any,
+      createWriteToolDefinition: () => ({ name: 'write', source: 'acp' }) as any
     }
   )
 
   assert.equal(fakeSession.agent.state.tools[0]!.source, 'builtin')
+  assert.equal(fakeSession.agent.state.tools[1]!.source, 'builtin')
 })
 
 test('PiAcpAgent: in-process AgentSession backend maps representative tool lifecycle events', async () => {

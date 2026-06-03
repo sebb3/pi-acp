@@ -43,16 +43,19 @@ type AgentSessionLike = {
 type CreateAgentSession = (options: Record<string, unknown>) => Promise<{ session: AgentSessionLike }>
 
 type CreateReadToolDefinition = (cwd: string, options?: Record<string, unknown>) => AgentToolLike
+type CreateWriteToolDefinition = (cwd: string, options?: Record<string, unknown>) => AgentToolLike
 
 type PiSdkModule = {
   createAgentSession?: CreateAgentSession
   createReadToolDefinition?: CreateReadToolDefinition
+  createWriteToolDefinition?: CreateWriteToolDefinition
   SessionManager?: PiSessionManagerCtorLike
 }
 
 type SpawnDeps = {
   createAgentSession?: CreateAgentSession
   createReadToolDefinition?: CreateReadToolDefinition
+  createWriteToolDefinition?: CreateWriteToolDefinition
 }
 
 type SpawnParams = {
@@ -79,25 +82,41 @@ export class AgentSessionProcess implements PiProcessLike {
     const sdk = deps.createAgentSession ? null : await loadPiSdkModule()
     const createAgentSession = deps.createAgentSession ?? sdk!.createAgentSession!
     const createReadToolDefinition = deps.createReadToolDefinition ?? sdk?.createReadToolDefinition
+    const createWriteToolDefinition = deps.createWriteToolDefinition ?? sdk?.createWriteToolDefinition
     const sessionManager = params.sessionPath ? sdk?.SessionManager?.open(params.sessionPath, undefined, params.cwd) : undefined
     const sessionIdRef = { current: '' }
-    const acpReadTool =
-      createReadToolDefinition && shouldUseAcpRead(params)
-        ? createAcpReadToolDefinition({
-            cwd: params.cwd,
-            conn: params.conn!,
-            createReadToolDefinition,
-            getSessionId: () => sessionIdRef.current
-          })
-        : undefined
+    const customTools: AgentToolLike[] = []
+
+    if (createReadToolDefinition && shouldUseAcpRead(params)) {
+      customTools.push(
+        createAcpReadToolDefinition({
+          cwd: params.cwd,
+          conn: params.conn!,
+          createReadToolDefinition,
+          getSessionId: () => sessionIdRef.current
+        })
+      )
+    }
+
+    if (createWriteToolDefinition && shouldUseAcpWrite(params)) {
+      customTools.push(
+        createAcpWriteToolDefinition({
+          cwd: params.cwd,
+          conn: params.conn!,
+          createWriteToolDefinition,
+          getSessionId: () => sessionIdRef.current
+        })
+      )
+    }
+
     const result = await createAgentSession({
       cwd: params.cwd,
       ...(sessionManager ? { sessionManager } : {}),
-      ...(acpReadTool ? { customTools: [acpReadTool] } : {})
+      ...(customTools.length > 0 ? { customTools } : {})
     })
 
     sessionIdRef.current = result.session.sessionId ?? ''
-    if (acpReadTool) installAcpReadTool(result.session, acpReadTool)
+    for (const customTool of customTools) installAcpTool(result.session, customTool)
 
     return new AgentSessionProcess(result.session)
   }
@@ -257,6 +276,10 @@ function shouldUseAcpRead(params: SpawnParams): boolean {
   return Boolean(params.conn && params.clientCapabilities?.fs?.readTextFile)
 }
 
+function shouldUseAcpWrite(params: SpawnParams): boolean {
+  return Boolean(params.conn && params.clientCapabilities?.fs?.writeTextFile)
+}
+
 function createAcpReadToolDefinition(opts: {
   cwd: string
   conn: AgentSideConnection
@@ -276,18 +299,36 @@ function createAcpReadToolDefinition(opts: {
   })
 }
 
-function installAcpReadTool(session: AgentSessionLike, acpReadTool: AgentToolLike): void {
+function createAcpWriteToolDefinition(opts: {
+  cwd: string
+  conn: AgentSideConnection
+  createWriteToolDefinition: CreateWriteToolDefinition
+  getSessionId: () => string
+}): AgentToolLike {
+  return opts.createWriteToolDefinition(opts.cwd, {
+    operations: {
+      mkdir: async (_dir: string) => {
+        // ACP has no mkdir primitive; fs.writeTextFile is the client-owned write boundary.
+      },
+      writeFile: async (absolutePath: string, content: string) => {
+        await opts.conn.writeTextFile({ sessionId: opts.getSessionId(), path: absolutePath, content })
+      }
+    }
+  })
+}
+
+function installAcpTool(session: AgentSessionLike, acpTool: AgentToolLike): void {
   const tools = session.agent?.state?.tools
-  if (!Array.isArray(tools)) return
+  if (!Array.isArray(tools) || !acpTool.name) return
 
   let replaced = false
   session.agent!.state!.tools = tools.map(tool => {
-    if (tool?.name !== 'read') return tool
+    if (tool?.name !== acpTool.name) return tool
     replaced = true
-    return acpReadTool
+    return acpTool
   })
 
-  if (!replaced) session.agent!.state!.tools = [acpReadTool, ...tools]
+  if (!replaced) session.agent!.state!.tools = [acpTool, ...tools]
 }
 
 function extractAssistantText(message: unknown): string {
