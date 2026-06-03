@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { PiAcpSession } from '../../src/acp/session.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
 
@@ -144,6 +145,49 @@ test('PiAcpSession: emits tool locations from pi path args', async () => {
   assert.equal(conn.updates.length, 1)
   assert.equal(conn.updates[0]!.update.sessionUpdate, 'tool_call')
   assert.deepEqual((conn.updates[0]!.update as any).locations, [{ path: `${process.cwd()}/src/acp/session.ts` }])
+})
+
+test('PiAcpSession: emits read results as embedded file resources', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const cwd = mkdtempSync(join(tmpdir(), 'pi-acp-read-resource-'))
+  writeFileSync(join(cwd, 'doc.md'), '# Title\n')
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd,
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({ type: 'tool_execution_start', toolCallId: 't1', toolName: 'read', args: { path: 'doc.md' } })
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId: 't1',
+    isError: false,
+    result: { content: [{ type: 'text', text: '# Title\n' }] }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 2)
+  assert.equal(conn.updates[1]!.update.sessionUpdate, 'tool_call_update')
+  assert.equal((conn.updates[1]!.update as any).status, 'completed')
+  assert.deepEqual((conn.updates[1]!.update as any).content, [
+    {
+      type: 'content',
+      content: {
+        type: 'resource',
+        resource: {
+          uri: pathToFileURL(join(cwd, 'doc.md')).toString(),
+          mimeType: 'text/markdown',
+          text: '# Title\n'
+        }
+      }
+    }
+  ])
 })
 
 test('PiAcpSession: emits agent_message_chunk for auto_retry_start with attempt/maxAttempts and rounded delay', async () => {

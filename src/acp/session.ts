@@ -10,7 +10,8 @@ import type {
 import { RequestError } from '@agentclientprotocol/sdk'
 import { maybeAuthRequiredError } from './auth-required.js'
 import { readFileSync } from 'node:fs'
-import { isAbsolute, resolve as resolvePath } from 'node:path'
+import { extname, isAbsolute, resolve as resolvePath } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { PiRpcProcess, PiRpcSpawnError, type PiRpcEvent } from '../pi-rpc/process.js'
 import { SessionStore } from './session-store.js'
 import { toolResultToText } from './translate/pi-tools.js'
@@ -64,6 +65,59 @@ function findUniqueLineNumber(text: string, needle: string): number | undefined 
     if (text.charCodeAt(i) === 10) line += 1
   }
   return line
+}
+
+function readMimeType(path: string): string {
+  switch (extname(path).toLowerCase()) {
+    case '.md':
+    case '.markdown':
+      return 'text/markdown'
+    case '.json':
+      return 'application/json'
+    case '.jsonl':
+      return 'application/x-ndjson'
+    case '.html':
+    case '.htm':
+      return 'text/html'
+    case '.css':
+      return 'text/css'
+    case '.js':
+    case '.mjs':
+    case '.cjs':
+      return 'text/javascript'
+    case '.ts':
+    case '.mts':
+    case '.cts':
+      return 'text/typescript'
+    case '.tsx':
+      return 'text/tsx'
+    case '.jsx':
+      return 'text/jsx'
+    case '.yaml':
+    case '.yml':
+      return 'application/yaml'
+    case '.xml':
+      return 'application/xml'
+    default:
+      return 'text/plain'
+  }
+}
+
+function readResourceContent(path: string, cwd: string, text: string): ToolCallContent[] {
+  const absPath = isAbsolute(path) ? path : resolvePath(cwd, path)
+  return [
+    {
+      type: 'content',
+      content: {
+        type: 'resource',
+        resource: {
+          uri: pathToFileURL(absPath).toString(),
+          mimeType: readMimeType(absPath),
+          text
+        }
+      }
+    }
+  ] satisfies ToolCallContent[]
 }
 
 function toToolCallLocations(args: unknown, cwd: string, line?: number): ToolCallLocation[] | undefined {
@@ -223,6 +277,7 @@ export class PiAcpSession {
   // This is due to pi sending diff as a string as opposed to ACP expected diff format.
   // Compatible format may need to be implemented in pi in the future.
   private editSnapshots = new Map<string, { path: string; oldText: string }>()
+  private readSnapshots = new Map<string, { path: string }>()
   private bashToolCallIds = new Set<string>()
   private bashOutputSnapshots = new Map<string, string>()
 
@@ -417,6 +472,7 @@ export class PiAcpSession {
   private cleanupToolCall(toolCallId: string): void {
     this.currentToolCalls.delete(toolCallId)
     this.editSnapshots.delete(toolCallId)
+    this.readSnapshots.delete(toolCallId)
     this.bashToolCallIds.delete(toolCallId)
     this.bashOutputSnapshots.delete(toolCallId)
   }
@@ -626,6 +682,11 @@ export class PiAcpSession {
           break
         }
 
+        if (toolName === 'read') {
+          const p = typeof args?.path === 'string' ? args.path : undefined
+          if (p) this.readSnapshots.set(toolCallId, { path: p })
+        }
+
         // Capture pre-edit file contents so we can emit a structured ACP diff on completion.
         if (toolName === 'edit') {
           const p = typeof args?.path === 'string' ? args.path : undefined
@@ -718,6 +779,11 @@ export class PiAcpSession {
         // This enables clients like Zed to render an actual diff UI.
         const snapshot = this.editSnapshots.get(toolCallId)
         let content: ToolCallContent[] | undefined
+
+        const readSnapshot = this.readSnapshots.get(toolCallId)
+        if (!isError && readSnapshot && text) {
+          content = readResourceContent(readSnapshot.path, this.cwd, text)
+        }
 
         if (!isError && snapshot) {
           try {
