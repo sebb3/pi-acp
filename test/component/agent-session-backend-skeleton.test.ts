@@ -9,6 +9,11 @@ class FakeAgentSession {
   readonly sessionId = 'agent-session-1'
   readonly sessionFile = undefined
   readonly model = { provider: 'test', id: 'model', modelId: 'model', name: 'model' }
+  readonly modelRegistry = {
+    getAvailable: () => [this.model],
+    find: (provider: string, modelId: string) =>
+      provider === this.model.provider && modelId === this.model.id ? this.model : undefined
+  }
   readonly thinkingLevel = 'medium'
   readonly steeringMode = 'all'
   readonly followUpMode = 'all'
@@ -16,6 +21,7 @@ class FakeAgentSession {
   readonly messages: any[] = []
   readonly prompts: Array<{ text: string; options: unknown }> = []
   abortCount = 0
+  modelSelections: unknown[] = []
   disposed = false
   private listeners: Array<(event: Record<string, unknown>) => void> = []
 
@@ -36,6 +42,10 @@ class FakeAgentSession {
 
   async abort(): Promise<void> {
     this.abortCount += 1
+  }
+
+  async setModel(model: unknown): Promise<void> {
+    this.modelSelections.push(model)
   }
 
   dispose(): void {
@@ -89,6 +99,43 @@ test('PiAcpAgent: in-process AgentSession backend can create, prompt, stream tex
     }),
     true
   )
+})
+
+test('PiAcpAgent: in-process AgentSession backend can revive a known session file and continue prompting', async () => {
+  const conn = new FakeAgentSideConnection()
+  const fakeSession = new FakeAgentSession()
+  let revivedSessionPath = ''
+
+  const sessions = new SessionManager({
+    async spawnProcess(params) {
+      revivedSessionPath = params.sessionPath ?? ''
+      return new AgentSessionProcess(fakeSession)
+    }
+  })
+
+  const agent = new PiAcpAgent(asAgentConn(conn), { sessionManager: sessions })
+  ;(agent as any).store.upsert({ sessionId: 'revivable', cwd: process.cwd(), sessionFile: '/tmp/revivable.jsonl' })
+
+  const promptPromise = agent.prompt({
+    sessionId: 'revivable',
+    prompt: [{ type: 'text', text: 'continue please' }]
+  } as any)
+
+  await new Promise(resolve => setTimeout(resolve, 0))
+  assert.equal(revivedSessionPath, '/tmp/revivable.jsonl')
+  assert.equal(fakeSession.prompts[0]!.text, 'continue please')
+
+  fakeSession.emit({ type: 'agent_end', messages: [], willRetry: false })
+  assert.deepEqual(await promptPromise, { stopReason: 'end_turn' })
+})
+
+test('AgentSessionProcess: maps model selection through the in-process session model registry', async () => {
+  const fakeSession = new FakeAgentSession()
+  const proc = new AgentSessionProcess(fakeSession)
+
+  await proc.setModel('test', 'model')
+
+  assert.deepEqual(fakeSession.modelSelections, [fakeSession.model])
 })
 
 test('PiAcpAgent: in-process AgentSession backend maps cancellation to cancelled stop reason', async () => {

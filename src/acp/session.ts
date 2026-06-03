@@ -40,6 +40,7 @@ type SessionCreateParams = {
 type ProcessSpawnParams = {
   cwd: string
   piCommand?: string
+  sessionPath?: string
 }
 
 type SessionManagerOptions = {
@@ -48,12 +49,13 @@ type SessionManagerOptions = {
 
 async function defaultSpawnProcess(params: ProcessSpawnParams): Promise<PiProcessLike> {
   if (process.env.PI_ACP_BACKEND === 'agent-session') {
-    return AgentSessionProcess.spawn({ cwd: params.cwd })
+    return AgentSessionProcess.spawn({ cwd: params.cwd, sessionPath: params.sessionPath })
   }
 
   return PiRpcProcess.spawn({
     cwd: params.cwd,
-    piCommand: params.piCommand
+    piCommand: params.piCommand,
+    sessionPath: params.sessionPath
   })
 }
 
@@ -196,6 +198,26 @@ export class SessionManager {
    * if it isn't already registered.
    */
   getOrCreate(sessionId: string, params: SessionCreateParams & { proc: PiProcessLike }): PiAcpSession {
+    return this.registerExisting(sessionId, params)
+  }
+
+  async reviveFromSessionFile(
+    sessionId: string,
+    params: SessionCreateParams & { sessionFile: string }
+  ): Promise<PiAcpSession> {
+    const existing = this.sessions.get(sessionId)
+    if (existing) return existing
+
+    const proc = await this.spawnProcess({
+      cwd: params.cwd,
+      piCommand: params.piCommand,
+      sessionPath: params.sessionFile
+    })
+
+    return this.registerExisting(sessionId, { ...params, proc })
+  }
+
+  private registerExisting(sessionId: string, params: SessionCreateParams & { proc: PiProcessLike }): PiAcpSession {
     const existing = this.sessions.get(sessionId)
     if (existing) return existing
 

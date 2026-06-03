@@ -352,10 +352,12 @@ var AgentSessionProcess = class _AgentSessionProcess {
   handlers = [];
   unsubscribe;
   static async spawn(params, deps = {}) {
-    const createAgentSession = deps.createAgentSession ?? await loadCreateAgentSession();
+    const sdk = deps.createAgentSession ? null : await loadPiSdkModule();
+    const createAgentSession = deps.createAgentSession ?? sdk.createAgentSession;
+    const sessionManager = params.sessionPath ? sdk?.SessionManager?.open(params.sessionPath, void 0, params.cwd) : void 0;
     const result = await createAgentSession({
       cwd: params.cwd,
-      ...params.sessionPath ? { sessionFile: params.sessionPath } : {}
+      ...sessionManager ? { sessionManager } : {}
     });
     return new _AgentSessionProcess(result.session);
   }
@@ -400,7 +402,7 @@ var AgentSessionProcess = class _AgentSessionProcess {
   }
   async getAvailableModels() {
     const registry = this.session.modelRegistry;
-    if (typeof registry?.getAvailableModels === "function") return registry.getAvailableModels();
+    if (typeof registry?.getAvailable === "function") return { models: registry.getAvailable() };
     if (Array.isArray(registry?.models)) return { models: registry.models };
     const model = this.session.model;
     if (!model) return { models: [] };
@@ -415,8 +417,12 @@ var AgentSessionProcess = class _AgentSessionProcess {
       ]
     };
   }
-  async setModel(_provider, _modelId) {
-    throw new Error("AgentSessionProcess.setModel is not implemented in the skeleton backend");
+  async setModel(provider, modelId) {
+    const model = this.session.modelRegistry?.find?.(provider, modelId);
+    if (!model) throw new Error(`Model not found: ${provider}/${modelId}`);
+    if (!this.session.setModel) throw new Error("AgentSessionProcess.setModel is not available");
+    await this.session.setModel(model);
+    return model;
   }
   async setThinkingLevel(level) {
     this.session.setThinkingLevel?.(level);
@@ -465,7 +471,7 @@ var AgentSessionProcess = class _AgentSessionProcess {
     return { commands: [] };
   }
 };
-async function loadCreateAgentSession() {
+async function loadPiSdkModule() {
   let mod;
   try {
     mod = await import(PI_PACKAGE);
@@ -480,7 +486,7 @@ async function loadCreateAgentSession() {
   if (typeof mod.createAgentSession !== "function") {
     throw new Error(`${PI_PACKAGE} does not export createAgentSession`);
   }
-  return mod.createAgentSession;
+  return mod;
 }
 function extractAssistantText(message) {
   const role = message?.role;
@@ -758,11 +764,12 @@ function expandSlashCommand(text, fileCommands) {
 // src/acp/session.ts
 async function defaultSpawnProcess(params) {
   if (process.env.PI_ACP_BACKEND === "agent-session") {
-    return AgentSessionProcess.spawn({ cwd: params.cwd });
+    return AgentSessionProcess.spawn({ cwd: params.cwd, sessionPath: params.sessionPath });
   }
   return PiRpcProcess.spawn({
     cwd: params.cwd,
-    piCommand: params.piCommand
+    piCommand: params.piCommand,
+    sessionPath: params.sessionPath
   });
 }
 function findUniqueLineNumber(text, needle) {
@@ -864,6 +871,19 @@ var SessionManager = class {
    * if it isn't already registered.
    */
   getOrCreate(sessionId, params) {
+    return this.registerExisting(sessionId, params);
+  }
+  async reviveFromSessionFile(sessionId, params) {
+    const existing = this.sessions.get(sessionId);
+    if (existing) return existing;
+    const proc = await this.spawnProcess({
+      cwd: params.cwd,
+      piCommand: params.piCommand,
+      sessionPath: params.sessionFile
+    });
+    return this.registerExisting(sessionId, { ...params, proc });
+  }
+  registerExisting(sessionId, params) {
     const existing = this.sessions.get(sessionId);
     if (existing) return existing;
     const session = new PiAcpSession({
@@ -1950,20 +1970,6 @@ var PiAcpAgent = class {
       return null;
     }
   }
-  async spawnPiSession(cwd, sessionFile) {
-    try {
-      return await PiRpcProcess.spawn({
-        cwd,
-        sessionPath: sessionFile,
-        piCommand: process.env.PI_ACP_PI_COMMAND
-      });
-    } catch (e) {
-      if (e?.name === "PiRpcSpawnError") {
-        throw RequestError3.internalError({ code: e?.code }, String(e?.message ?? e));
-      }
-      throw e;
-    }
-  }
   resolveKnownSession(sessionId, cwdHint) {
     const stored = this.store.get(sessionId);
     if (stored?.sessionFile) {
@@ -1983,12 +1989,11 @@ var PiAcpAgent = class {
     const known = this.resolveKnownSession(sessionId, opts.cwd);
     if (!known) throw RequestError3.invalidParams(`Unknown sessionId: ${sessionId}`);
     if (!isAbsolute3(known.cwd)) throw RequestError3.invalidParams(`cwd must be an absolute path: ${known.cwd}`);
-    const proc = await this.spawnPiSession(known.cwd, known.sessionFile);
-    const session = this.sessions.getOrCreate(sessionId, {
+    const session = await this.sessions.reviveFromSessionFile(sessionId, {
       cwd: known.cwd,
       mcpServers: opts.mcpServers ?? [],
       conn: this.conn,
-      proc,
+      sessionFile: known.sessionFile,
       fileCommands: loadSlashCommands(known.cwd),
       piCommand: process.env.PI_ACP_PI_COMMAND
     });

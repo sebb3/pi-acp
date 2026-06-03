@@ -23,7 +23,6 @@ import { getAuthMethods } from './auth.js'
 import { SessionManager, type PiAcpSession } from './session.js'
 import type { PiProcessLike } from '../pi-process/types.js'
 import { SessionStore } from './session-store.js'
-import { PiRpcProcess } from '../pi-rpc/process.js'
 import { listPiSessions, findPiSessionFile } from './pi-sessions.js'
 import { normalizePiAssistantText, normalizePiMessageText } from './translate/pi-messages.js'
 import { toolResultToText } from './translate/pi-tools.js'
@@ -161,21 +160,6 @@ export class PiAcpAgent implements ACPAgent {
     }
   }
 
-  private async spawnPiSession(cwd: string, sessionFile: string): Promise<PiProcessLike> {
-    try {
-      return await PiRpcProcess.spawn({
-        cwd,
-        sessionPath: sessionFile,
-        piCommand: process.env.PI_ACP_PI_COMMAND
-      })
-    } catch (e: any) {
-      if (e?.name === 'PiRpcSpawnError') {
-        throw RequestError.internalError({ code: e?.code }, String(e?.message ?? e))
-      }
-      throw e
-    }
-  }
-
   private resolveKnownSession(sessionId: string, cwdHint?: string): { cwd: string; sessionFile: string } | null {
     const stored = this.store.get(sessionId)
     if (stored?.sessionFile) {
@@ -204,12 +188,11 @@ export class PiAcpAgent implements ACPAgent {
     if (!known) throw RequestError.invalidParams(`Unknown sessionId: ${sessionId}`)
     if (!isAbsolute(known.cwd)) throw RequestError.invalidParams(`cwd must be an absolute path: ${known.cwd}`)
 
-    const proc = await this.spawnPiSession(known.cwd, known.sessionFile)
-    const session = this.sessions.getOrCreate(sessionId, {
+    const session = await this.sessions.reviveFromSessionFile(sessionId, {
       cwd: known.cwd,
       mcpServers: (opts.mcpServers ?? []) as any,
       conn: this.conn,
-      proc,
+      sessionFile: known.sessionFile,
       fileCommands: loadSlashCommands(known.cwd),
       piCommand: process.env.PI_ACP_PI_COMMAND
     })

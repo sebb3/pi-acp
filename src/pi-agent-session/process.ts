@@ -1,5 +1,17 @@
 import type { PiProcessEvent, PiProcessLike, ThinkingLevel } from '../pi-process/types.js'
 
+type PiModelLike = { provider?: string; modelId?: string; id?: string; name?: string }
+
+type PiModelRegistryLike = {
+  getAvailable?: () => PiModelLike[]
+  find?: (provider: string, modelId: string) => PiModelLike | undefined
+  models?: PiModelLike[]
+}
+
+type PiSessionManagerCtorLike = {
+  open(path: string, sessionDir?: string, cwdOverride?: string): unknown
+}
+
 type AgentSessionLike = {
   subscribe(listener: (event: PiProcessEvent) => void): () => void
   prompt(text: string, options?: { images?: unknown[]; source?: string }): Promise<void>
@@ -8,14 +20,14 @@ type AgentSessionLike = {
   sessionId?: string
   sessionFile?: string
   sessionName?: string
-  model?: { provider?: string; modelId?: string; id?: string; name?: string }
+  model?: PiModelLike
   thinkingLevel?: string
   steeringMode?: 'all' | 'one-at-a-time'
   followUpMode?: 'all' | 'one-at-a-time'
   autoCompactionEnabled?: boolean
   messages?: unknown[]
   state?: unknown
-  modelRegistry?: { getAvailableModels?: () => Promise<unknown> | unknown; models?: unknown[] }
+  modelRegistry?: PiModelRegistryLike
   setModel?: (model: unknown) => Promise<void>
   setThinkingLevel?: (level: ThinkingLevel) => void
   setFollowUpMode?: (mode: 'all' | 'one-at-a-time') => void
@@ -25,6 +37,11 @@ type AgentSessionLike = {
 }
 
 type CreateAgentSession = (options: Record<string, unknown>) => Promise<{ session: AgentSessionLike }>
+
+type PiSdkModule = {
+  createAgentSession?: CreateAgentSession
+  SessionManager?: PiSessionManagerCtorLike
+}
 
 type SpawnDeps = {
   createAgentSession?: CreateAgentSession
@@ -49,10 +66,12 @@ export class AgentSessionProcess implements PiProcessLike {
   }
 
   static async spawn(params: SpawnParams, deps: SpawnDeps = {}): Promise<AgentSessionProcess> {
-    const createAgentSession = deps.createAgentSession ?? (await loadCreateAgentSession())
+    const sdk = deps.createAgentSession ? null : await loadPiSdkModule()
+    const createAgentSession = deps.createAgentSession ?? sdk!.createAgentSession!
+    const sessionManager = params.sessionPath ? sdk?.SessionManager?.open(params.sessionPath, undefined, params.cwd) : undefined
     const result = await createAgentSession({
       cwd: params.cwd,
-      ...(params.sessionPath ? { sessionFile: params.sessionPath } : {})
+      ...(sessionManager ? { sessionManager } : {})
     })
     return new AgentSessionProcess(result.session)
   }
@@ -106,7 +125,7 @@ export class AgentSessionProcess implements PiProcessLike {
 
   async getAvailableModels(): Promise<unknown> {
     const registry = this.session.modelRegistry
-    if (typeof registry?.getAvailableModels === 'function') return registry.getAvailableModels()
+    if (typeof registry?.getAvailable === 'function') return { models: registry.getAvailable() }
     if (Array.isArray(registry?.models)) return { models: registry.models }
     const model = this.session.model
     if (!model) return { models: [] }
@@ -122,8 +141,12 @@ export class AgentSessionProcess implements PiProcessLike {
     }
   }
 
-  async setModel(_provider: string, _modelId: string): Promise<unknown> {
-    throw new Error('AgentSessionProcess.setModel is not implemented in the skeleton backend')
+  async setModel(provider: string, modelId: string): Promise<unknown> {
+    const model = this.session.modelRegistry?.find?.(provider, modelId)
+    if (!model) throw new Error(`Model not found: ${provider}/${modelId}`)
+    if (!this.session.setModel) throw new Error('AgentSessionProcess.setModel is not available')
+    await this.session.setModel(model)
+    return model
   }
 
   async setThinkingLevel(level: ThinkingLevel): Promise<void> {
@@ -185,10 +208,10 @@ export class AgentSessionProcess implements PiProcessLike {
   }
 }
 
-async function loadCreateAgentSession(): Promise<CreateAgentSession> {
-  let mod: { createAgentSession?: CreateAgentSession }
+async function loadPiSdkModule(): Promise<Required<Pick<PiSdkModule, 'createAgentSession'>> & PiSdkModule> {
+  let mod: PiSdkModule
   try {
-    mod = (await import(PI_PACKAGE)) as { createAgentSession?: CreateAgentSession }
+    mod = (await import(PI_PACKAGE)) as PiSdkModule
   } catch (e: any) {
     if (e?.code === 'ERR_MODULE_NOT_FOUND') {
       throw new Error(
@@ -201,7 +224,7 @@ async function loadCreateAgentSession(): Promise<CreateAgentSession> {
   if (typeof mod.createAgentSession !== 'function') {
     throw new Error(`${PI_PACKAGE} does not export createAgentSession`)
   }
-  return mod.createAgentSession
+  return mod as Required<Pick<PiSdkModule, 'createAgentSession'>> & PiSdkModule
 }
 
 function extractAssistantText(message: unknown): string {
