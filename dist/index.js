@@ -636,6 +636,11 @@ function compactAcpText(text, maxChars = MAX_ACP_TOOL_TEXT_CHARS) {
 
 [pi-acp: truncated ${omitted} chars from ACP client payload; full output remains in the pi session.]`;
 }
+function isAcpBridgeReadResult(value) {
+  const details = value?.details;
+  const acpBridge = details?.acpBridge;
+  return acpBridge?.source === "fs.readTextFile";
+}
 function sanitizeAcpRawOutput(value) {
   if (!value || typeof value !== "object") return value;
   try {
@@ -652,6 +657,24 @@ function sanitizeAcpRawOutput(value) {
   } catch {
     return { summary: "[pi-acp: raw tool output omitted from ACP payload]" };
   }
+}
+function toPromptUsage(stats) {
+  const tokens = stats?.tokens;
+  if (!tokens || typeof tokens !== "object") return void 0;
+  const inputTokens = typeof tokens.input === "number" ? tokens.input : 0;
+  const outputTokens = typeof tokens.output === "number" ? tokens.output : 0;
+  const cachedReadTokens = typeof tokens.cacheRead === "number" ? tokens.cacheRead : void 0;
+  const cachedWriteTokens = typeof tokens.cacheWrite === "number" ? tokens.cacheWrite : void 0;
+  const thoughtTokens = typeof tokens.thought === "number" ? tokens.thought : void 0;
+  const totalTokens = typeof tokens.total === "number" ? tokens.total : inputTokens + outputTokens + (cachedReadTokens ?? 0) + (cachedWriteTokens ?? 0) + (thoughtTokens ?? 0);
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens,
+    ...cachedReadTokens !== void 0 ? { cachedReadTokens } : {},
+    ...cachedWriteTokens !== void 0 ? { cachedWriteTokens } : {},
+    ...thoughtTokens !== void 0 ? { thoughtTokens } : {}
+  };
 }
 function bashOutputContent(text) {
   if (!text) return void 0;
@@ -837,6 +860,7 @@ var PiAcpSession = class {
   rawInputUpdateToolCallIds = /* @__PURE__ */ new Set();
   bashToolCallIds = /* @__PURE__ */ new Set();
   bashOutputSnapshots = /* @__PURE__ */ new Map();
+  lastPromptUsage;
   // Ensure `session/update` notifications are sent in order and can be awaited
   // before completing a `session/prompt` request.
   lastEmit = Promise.resolve();
@@ -931,6 +955,30 @@ var PiAcpSession = class {
   }
   async flushEmits() {
     await this.lastEmit;
+  }
+  getLastPromptUsage() {
+    return this.lastPromptUsage;
+  }
+  async publishUsage() {
+    let stats;
+    try {
+      stats = await this.proc.getSessionStats();
+    } catch {
+      return;
+    }
+    if (!stats || typeof stats !== "object") return;
+    this.lastPromptUsage = toPromptUsage(stats);
+    const contextUsage = stats.contextUsage;
+    const size = contextUsage && typeof contextUsage === "object" && typeof contextUsage.contextWindow === "number" ? contextUsage.contextWindow : void 0;
+    if (size === void 0) return;
+    const used = typeof contextUsage.tokens === "number" ? contextUsage.tokens : 0;
+    const cost = typeof stats.cost === "number" ? { amount: stats.cost, currency: "USD" } : void 0;
+    this.emit({
+      sessionUpdate: "usage_update",
+      used,
+      size,
+      ...cost ? { cost } : {}
+    });
   }
   emitBashToolCall(params) {
     this.bashToolCallIds.add(params.toolCallId);
@@ -1070,6 +1118,7 @@ var PiAcpSession = class {
           );
           const toolCallId = String(toolCall?.id ?? "");
           const toolName = String(toolCall?.name ?? "tool");
+          if (toolName === "read") break;
           if (toolCallId) {
             const rawInput = toolCall?.arguments && typeof toolCall.arguments === "object" ? toolCall.arguments : (() => {
               const s = String(toolCall?.partialArgs ?? "");
@@ -1144,6 +1193,7 @@ var PiAcpSession = class {
         if (toolName === "read") {
           const p = typeof args?.path === "string" ? args.path : void 0;
           if (p) this.readSnapshots.set(toolCallId, { path: p });
+          break;
         }
         if (toolName === "edit") {
           const p = typeof args?.path === "string" ? args.path : void 0;
@@ -1187,6 +1237,7 @@ var PiAcpSession = class {
         const toolCallId = String(ev.toolCallId ?? "");
         if (!toolCallId) break;
         const partial = ev.partialResult;
+        if (this.readSnapshots.has(toolCallId)) break;
         if (this.bashToolCallIds.has(toolCallId)) {
           this.emitBashOutputUpdate({ toolCallId, status: "in_progress", result: partial });
           break;
@@ -1217,9 +1268,22 @@ var PiAcpSession = class {
           break;
         }
         const text = toolResultToText(result);
+        const readSnapshot = this.readSnapshots.get(toolCallId);
+        if (readSnapshot && isAcpBridgeReadResult(result)) {
+          this.emit({
+            sessionUpdate: "tool_call",
+            toolCallId,
+            title: toolTitle("read", { path: readSnapshot.path }),
+            kind: "read",
+            status: isError ? "failed" : "completed",
+            locations: toToolCallLocations({ path: readSnapshot.path }, this.cwd),
+            _meta: { piAcp: { source: "fs.readTextFile" } }
+          });
+          this.cleanupToolCall(toolCallId);
+          break;
+        }
         const snapshot = this.editSnapshots.get(toolCallId);
         let content;
-        const readSnapshot = this.readSnapshots.get(toolCallId);
         if (!isError && readSnapshot && text) {
           content = readResourceContent(readSnapshot.path, this.cwd, text);
         }
@@ -1245,6 +1309,17 @@ var PiAcpSession = class {
           content = [
             { type: "content", content: { type: "text", text: compactAcpText(text) } }
           ];
+        }
+        if (readSnapshot && !this.currentToolCalls.has(toolCallId)) {
+          this.currentToolCalls.set(toolCallId, "in_progress");
+          this.emit({
+            sessionUpdate: "tool_call",
+            toolCallId,
+            title: toolTitle("read", { path: readSnapshot.path }),
+            kind: "read",
+            status: isError ? "failed" : "completed",
+            locations: toToolCallLocations({ path: readSnapshot.path }, this.cwd)
+          });
         }
         this.emit({
           sessionUpdate: "tool_call_update",
@@ -1298,7 +1373,7 @@ var PiAcpSession = class {
         break;
       }
       case "agent_end": {
-        void this.flushEmits().finally(() => {
+        void this.publishUsage().then(() => this.flushEmits()).finally(() => {
           const reason = this.cancelRequested ? "cancelled" : "end_turn";
           const shouldAutoName = reason === "end_turn" && this.completedTurnCount === 0;
           this.completedTurnCount += 1;
@@ -1953,6 +2028,14 @@ function builtinAvailableCommands() {
       description: "Show session stats (messages, tokens, cost, session file)"
     },
     {
+      name: "usage",
+      description: "Show token usage, context window, remaining context, and cost"
+    },
+    {
+      name: "plan-test",
+      description: "Show a sample ACP plan in the client UI"
+    },
+    {
       name: "name",
       description: "Set session display name",
       input: { hint: "<name>" }
@@ -1982,6 +2065,48 @@ function mergeCommands(a, b) {
     out.push(c);
   }
   return out;
+}
+function formatCount(n) {
+  return Math.round(n).toLocaleString("en-US");
+}
+function formatPercent(n) {
+  if (!Number.isFinite(n)) return "0%";
+  return `${Number.isInteger(n) ? n.toFixed(0) : n.toFixed(1)}%`;
+}
+function formatUsageStats(stats) {
+  const lines = ["Usage"];
+  const contextUsage = stats?.contextUsage;
+  if (contextUsage && typeof contextUsage === "object") {
+    const tokens = typeof contextUsage.tokens === "number" ? contextUsage.tokens : null;
+    const window = typeof contextUsage.contextWindow === "number" ? contextUsage.contextWindow : null;
+    const percent = typeof contextUsage.percent === "number" ? contextUsage.percent : tokens !== null && window && window > 0 ? tokens / window * 100 : null;
+    if (tokens !== null && window !== null) {
+      const remaining = Math.max(0, window - tokens);
+      lines.push(`Context: ${formatCount(tokens)} / ${formatCount(window)} tokens`);
+      lines.push(
+        `Remaining: ${formatCount(remaining)} tokens${percent !== null ? ` (${formatPercent(100 - percent)} free)` : ""}`
+      );
+      if (percent !== null) lines.push(`Used: ${formatPercent(percent)}`);
+    } else if (tokens !== null) {
+      lines.push(`Context tokens: ${formatCount(tokens)}`);
+    } else if (window !== null) {
+      lines.push(`Context window: ${formatCount(window)} tokens`);
+    }
+  }
+  const t = stats?.tokens;
+  if (t && typeof t === "object") {
+    const parts = [];
+    if (typeof t.input === "number") parts.push(`input ${formatCount(t.input)}`);
+    if (typeof t.output === "number") parts.push(`output ${formatCount(t.output)}`);
+    if (typeof t.cacheRead === "number") parts.push(`cache read ${formatCount(t.cacheRead)}`);
+    if (typeof t.cacheWrite === "number") parts.push(`cache write ${formatCount(t.cacheWrite)}`);
+    if (typeof t.total === "number") parts.push(`total ${formatCount(t.total)}`);
+    if (parts.length) lines.push(`Tokens: ${parts.join(", ")}`);
+  }
+  if (typeof stats?.cost === "number") lines.push(`Cost: $${stats.cost.toFixed(4)}`);
+  if (typeof stats?.totalMessages === "number") lines.push(`Messages: ${formatCount(stats.totalMessages)}`);
+  return lines.length > 1 ? lines.join("\n") : `Usage stats:
+${JSON.stringify(stats, null, 2)}`;
 }
 var pkg = readNearestPackageJson(import.meta.url);
 var PiAcpAgent = class {
@@ -2093,7 +2218,7 @@ var PiAcpAgent = class {
         promptCapabilities: {
           image: true,
           audio: false,
-          embeddedContext: process.env.PI_ACP_ENABLE_EMBEDDED_CONTEXT === "true"
+          embeddedContext: process.env.PI_ACP_ENABLE_EMBEDDED_CONTEXT !== "false"
         },
         sessionCapabilities: {
           // **UNSTABLE** ACP capability used by Zed's codex-acp adapter.
@@ -2177,6 +2302,7 @@ var PiAcpAgent = class {
       sessionId: session.sessionId,
       models,
       modes: thinking,
+      configOptions: buildConfigOptions(models, thinking),
       _meta: {
         piAcp: {
           startupInfo: preludeText || null
@@ -2243,6 +2369,53 @@ ${summary}` : "");
           update: {
             sessionUpdate: "agent_message_chunk",
             content: { type: "text", text }
+          }
+        });
+        return { stopReason: "end_turn" };
+      }
+      if (cmd === "usage" || cmd === "context") {
+        const stats = await session.proc.getSessionStats();
+        await this.conn.sessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: formatUsageStats(stats) }
+          }
+        });
+        return { stopReason: "end_turn" };
+      }
+      if (cmd === "plan-test") {
+        await this.conn.sessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: "plan",
+            entries: [
+              {
+                content: "Inspect Zed ACP plan rendering",
+                status: "completed",
+                priority: "high"
+              },
+              {
+                content: "Populate a sample plan from `pi-acp`",
+                status: "in_progress",
+                priority: "high"
+              },
+              {
+                content: "Decide whether to map real Pi progress into this UI",
+                status: "pending",
+                priority: "medium"
+              }
+            ]
+          }
+        });
+        await this.conn.sessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: {
+              type: "text",
+              text: "Sent a sample ACP plan. If Zed renders plans, it should appear in the thread UI."
+            }
           }
         });
         return { stopReason: "end_turn" };
@@ -2587,7 +2760,7 @@ ${JSON.stringify(stats, null, 2)}`;
     }
     const result = await session.prompt(message, images);
     const stopReason = result === "error" ? session.wasCancelRequested() ? "cancelled" : "end_turn" : result;
-    return { stopReason };
+    return { stopReason, usage: session.getLastPromptUsage() ?? null };
   }
   async cancel(params) {
     const session = await this.getOrReviveSession(params.sessionId);
@@ -2723,6 +2896,7 @@ ${text2.trimEnd()}
     const response = {
       models,
       modes: thinking,
+      configOptions: buildConfigOptions(models, thinking),
       _meta: {
         piAcp: {
           startupInfo: null
@@ -2783,6 +2957,36 @@ ${text2.trimEnd()}
     }
     await session.proc.setModel(provider, modelId);
   }
+  async setSessionConfigOption(params) {
+    const configId = String(params.configId);
+    const value = String(params.value);
+    const session = await this.getOrReviveSession(params.sessionId);
+    if (configId === "model") {
+      await this.unstable_setSessionModel({ sessionId: params.sessionId, modelId: value });
+    } else if (configId === "thinking") {
+      if (!isThinkingLevel(value)) throw RequestError3.invalidParams(`Unknown thinking level: ${value}`);
+      await session.proc.setThinkingLevel(value);
+      void this.conn.sessionUpdate({
+        sessionId: session.sessionId,
+        update: {
+          sessionUpdate: "current_mode_update",
+          currentModeId: value
+        }
+      });
+    } else {
+      throw RequestError3.invalidParams(`Unknown configId: ${configId}`);
+    }
+    const [models, thinking] = await Promise.all([getModelState(session.proc), getThinkingState(session.proc)]);
+    const configOptions = buildConfigOptions(models, thinking);
+    void this.conn.sessionUpdate({
+      sessionId: session.sessionId,
+      update: {
+        sessionUpdate: "config_option_update",
+        configOptions
+      }
+    });
+    return { configOptions };
+  }
   async setSessionMode(params) {
     const mode = String(params.modeId);
     if (!isThinkingLevel(mode)) {
@@ -2800,6 +3004,39 @@ ${text2.trimEnd()}
     return {};
   }
 };
+function buildConfigOptions(models, thinking) {
+  const options = [
+    {
+      id: "thinking",
+      name: "Thinking",
+      description: "Pi reasoning effort for this session.",
+      category: "thought_level",
+      type: "select",
+      currentValue: thinking.currentModeId,
+      options: thinking.availableModes.map((mode) => ({
+        value: mode.id,
+        name: mode.name.replace(/^Thinking: /, ""),
+        description: mode.description ?? null
+      }))
+    }
+  ];
+  if (models && models.availableModels.length) {
+    options.unshift({
+      id: "model",
+      name: "Model",
+      description: "Pi model for this session.",
+      category: "model",
+      type: "select",
+      currentValue: models.currentModelId,
+      options: models.availableModels.map((model) => ({
+        value: model.modelId,
+        name: model.name,
+        description: model.description ?? null
+      }))
+    });
+  }
+  return options;
+}
 function isThinkingLevel(x) {
   return x === "off" || x === "minimal" || x === "low" || x === "medium" || x === "high" || x === "xhigh";
 }
@@ -2863,7 +3100,7 @@ async function getModelState(proc, pre) {
   if (!currentModelId) currentModelId = availableModels[0]?.modelId ?? "default";
   return {
     availableModels,
-    currentModelId
+    currentModelId: currentModelId ?? "default"
   };
 }
 function isSemver(v) {

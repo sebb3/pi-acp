@@ -10,14 +10,16 @@ import {
   type ListSessionsResponse,
   type LoadSessionRequest,
   type LoadSessionResponse,
-  type ModelInfo,
   type NewSessionRequest,
   type PromptRequest,
   type PromptResponse,
   type SessionInfo,
+  type SetSessionConfigOptionRequest,
+  type SetSessionConfigOptionResponse,
   type SetSessionModeRequest,
   type SetSessionModeResponse,
-  type StopReason
+  type StopReason,
+  type SessionConfigOption
 } from '@agentclientprotocol/sdk'
 import { getAuthMethods } from './auth.js'
 import { SessionManager, type PiAcpSession } from './session.js'
@@ -50,6 +52,26 @@ import { spawnSync } from 'node:child_process'
 
 type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
 
+type ModelInfo = {
+  modelId: string
+  name: string
+  description?: string | null
+}
+
+type ModelState = {
+  availableModels: ModelInfo[]
+  currentModelId: string
+}
+
+type ThinkingState = {
+  availableModes: Array<{
+    id: string
+    name: string
+    description?: string | null
+  }>
+  currentModeId: string
+}
+
 function builtinAvailableCommands(): AvailableCommand[] {
   return [
     {
@@ -69,6 +91,14 @@ function builtinAvailableCommands(): AvailableCommand[] {
     {
       name: 'session',
       description: 'Show session stats (messages, tokens, cost, session file)'
+    },
+    {
+      name: 'usage',
+      description: 'Show token usage, context window, remaining context, and cost'
+    },
+    {
+      name: 'plan-test',
+      description: 'Show a sample ACP plan in the client UI'
     },
     {
       name: 'name',
@@ -104,6 +134,60 @@ function mergeCommands(a: AvailableCommand[], b: AvailableCommand[]): AvailableC
   }
 
   return out
+}
+
+function formatCount(n: number): string {
+  return Math.round(n).toLocaleString('en-US')
+}
+
+function formatPercent(n: number): string {
+  if (!Number.isFinite(n)) return '0%'
+  return `${Number.isInteger(n) ? n.toFixed(0) : n.toFixed(1)}%`
+}
+
+function formatUsageStats(stats: any): string {
+  const lines: string[] = ['Usage']
+
+  const contextUsage = stats?.contextUsage
+  if (contextUsage && typeof contextUsage === 'object') {
+    const tokens = typeof contextUsage.tokens === 'number' ? contextUsage.tokens : null
+    const window = typeof contextUsage.contextWindow === 'number' ? contextUsage.contextWindow : null
+    const percent =
+      typeof contextUsage.percent === 'number'
+        ? contextUsage.percent
+        : tokens !== null && window && window > 0
+          ? (tokens / window) * 100
+          : null
+
+    if (tokens !== null && window !== null) {
+      const remaining = Math.max(0, window - tokens)
+      lines.push(`Context: ${formatCount(tokens)} / ${formatCount(window)} tokens`)
+      lines.push(
+        `Remaining: ${formatCount(remaining)} tokens${percent !== null ? ` (${formatPercent(100 - percent)} free)` : ''}`
+      )
+      if (percent !== null) lines.push(`Used: ${formatPercent(percent)}`)
+    } else if (tokens !== null) {
+      lines.push(`Context tokens: ${formatCount(tokens)}`)
+    } else if (window !== null) {
+      lines.push(`Context window: ${formatCount(window)} tokens`)
+    }
+  }
+
+  const t = stats?.tokens
+  if (t && typeof t === 'object') {
+    const parts: string[] = []
+    if (typeof t.input === 'number') parts.push(`input ${formatCount(t.input)}`)
+    if (typeof t.output === 'number') parts.push(`output ${formatCount(t.output)}`)
+    if (typeof t.cacheRead === 'number') parts.push(`cache read ${formatCount(t.cacheRead)}`)
+    if (typeof t.cacheWrite === 'number') parts.push(`cache write ${formatCount(t.cacheWrite)}`)
+    if (typeof t.total === 'number') parts.push(`total ${formatCount(t.total)}`)
+    if (parts.length) lines.push(`Tokens: ${parts.join(', ')}`)
+  }
+
+  if (typeof stats?.cost === 'number') lines.push(`Cost: $${stats.cost.toFixed(4)}`)
+  if (typeof stats?.totalMessages === 'number') lines.push(`Messages: ${formatCount(stats.totalMessages)}`)
+
+  return lines.length > 1 ? lines.join('\n') : `Usage stats:\n${JSON.stringify(stats, null, 2)}`
 }
 import { fileURLToPath } from 'node:url'
 
@@ -247,7 +331,7 @@ export class PiAcpAgent implements ACPAgent {
         promptCapabilities: {
           image: true,
           audio: false,
-          embeddedContext: process.env.PI_ACP_ENABLE_EMBEDDED_CONTEXT === 'true'
+          embeddedContext: process.env.PI_ACP_ENABLE_EMBEDDED_CONTEXT !== 'false'
         },
         sessionCapabilities: {
           // **UNSTABLE** ACP capability used by Zed's codex-acp adapter.
@@ -364,6 +448,7 @@ export class PiAcpAgent implements ACPAgent {
       sessionId: session.sessionId,
       models,
       modes: thinking,
+      configOptions: buildConfigOptions(models, thinking),
       _meta: {
         piAcp: {
           startupInfo: preludeText || null
@@ -452,6 +537,57 @@ export class PiAcpAgent implements ACPAgent {
           update: {
             sessionUpdate: 'agent_message_chunk',
             content: { type: 'text', text }
+          }
+        })
+
+        return { stopReason: 'end_turn' }
+      }
+
+      if (cmd === 'usage' || cmd === 'context') {
+        const stats = (await session.proc.getSessionStats()) as any
+        await this.conn.sessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: formatUsageStats(stats) }
+          }
+        })
+
+        return { stopReason: 'end_turn' }
+      }
+
+      if (cmd === 'plan-test') {
+        await this.conn.sessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: 'plan',
+            entries: [
+              {
+                content: 'Inspect Zed ACP plan rendering',
+                status: 'completed',
+                priority: 'high'
+              },
+              {
+                content: 'Populate a sample plan from `pi-acp`',
+                status: 'in_progress',
+                priority: 'high'
+              },
+              {
+                content: 'Decide whether to map real Pi progress into this UI',
+                status: 'pending',
+                priority: 'medium'
+              }
+            ]
+          }
+        })
+        await this.conn.sessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: {
+              type: 'text',
+              text: 'Sent a sample ACP plan. If Zed renders plans, it should appear in the thread UI.'
+            }
           }
         })
 
@@ -872,7 +1008,7 @@ export class PiAcpAgent implements ACPAgent {
     const stopReason: StopReason =
       result === 'error' ? (session.wasCancelRequested() ? 'cancelled' : 'end_turn') : result
 
-    return { stopReason }
+    return { stopReason, usage: session.getLastPromptUsage() ?? null }
   }
 
   async cancel(params: CancelNotification): Promise<void> {
@@ -1039,6 +1175,7 @@ export class PiAcpAgent implements ACPAgent {
     const response = {
       models,
       modes: thinking,
+      configOptions: buildConfigOptions(models, thinking),
       _meta: {
         piAcp: {
           startupInfo: null
@@ -1115,6 +1252,41 @@ export class PiAcpAgent implements ACPAgent {
     await session.proc.setModel(provider, modelId)
   }
 
+  async setSessionConfigOption(params: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
+    const configId = String(params.configId)
+    const value = String(params.value)
+    const session = await this.getOrReviveSession(params.sessionId)
+
+    if (configId === 'model') {
+      await this.unstable_setSessionModel({ sessionId: params.sessionId, modelId: value })
+    } else if (configId === 'thinking') {
+      if (!isThinkingLevel(value)) throw RequestError.invalidParams(`Unknown thinking level: ${value}`)
+      await session.proc.setThinkingLevel(value)
+      void this.conn.sessionUpdate({
+        sessionId: session.sessionId,
+        update: {
+          sessionUpdate: 'current_mode_update',
+          currentModeId: value
+        }
+      })
+    } else {
+      throw RequestError.invalidParams(`Unknown configId: ${configId}`)
+    }
+
+    const [models, thinking] = await Promise.all([getModelState(session.proc), getThinkingState(session.proc)])
+    const configOptions = buildConfigOptions(models, thinking)
+
+    void this.conn.sessionUpdate({
+      sessionId: session.sessionId,
+      update: {
+        sessionUpdate: 'config_option_update',
+        configOptions
+      } as any
+    })
+
+    return { configOptions }
+  }
+
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
     const mode = String(params.modeId)
     if (!isThinkingLevel(mode)) {
@@ -1138,21 +1310,47 @@ export class PiAcpAgent implements ACPAgent {
   }
 }
 
+function buildConfigOptions(models: ModelState | null, thinking: ThinkingState): SessionConfigOption[] {
+  const options: SessionConfigOption[] = [
+    {
+      id: 'thinking',
+      name: 'Thinking',
+      description: 'Pi reasoning effort for this session.',
+      category: 'thought_level',
+      type: 'select',
+      currentValue: thinking.currentModeId,
+      options: thinking.availableModes.map(mode => ({
+        value: mode.id,
+        name: mode.name.replace(/^Thinking: /, ''),
+        description: mode.description ?? null
+      }))
+    }
+  ]
+
+  if (models && models.availableModels.length) {
+    options.unshift({
+      id: 'model',
+      name: 'Model',
+      description: 'Pi model for this session.',
+      category: 'model',
+      type: 'select',
+      currentValue: models.currentModelId,
+      options: models.availableModels.map(model => ({
+        value: model.modelId,
+        name: model.name,
+        description: model.description ?? null
+      }))
+    })
+  }
+
+  return options
+}
+
 function isThinkingLevel(x: string): x is ThinkingLevel {
   return x === 'off' || x === 'minimal' || x === 'low' || x === 'medium' || x === 'high' || x === 'xhigh'
 }
 
-async function getThinkingState(
-  proc: PiRpcProcess,
-  pre?: { state?: any | null }
-): Promise<{
-  availableModes: Array<{
-    id: string
-    name: string
-    description?: string | null
-  }>
-  currentModeId: string
-}> {
+async function getThinkingState(proc: PiRpcProcess, pre?: { state?: any | null }): Promise<ThinkingState> {
   // Ask pi for current thinking level.
   let current: ThinkingLevel = 'medium'
 
@@ -1184,10 +1382,7 @@ async function getThinkingState(
 async function getModelState(
   proc: PiRpcProcess,
   pre?: { state?: any | null; availableModels?: any | null }
-): Promise<{
-  availableModels: ModelInfo[]
-  currentModelId: string
-} | null> {
+): Promise<ModelState | null> {
   // Ask pi for available models.
   let availableModels: ModelInfo[] = []
 
@@ -1244,7 +1439,7 @@ async function getModelState(
 
   return {
     availableModels,
-    currentModelId
+    currentModelId: currentModelId ?? 'default'
   }
 }
 

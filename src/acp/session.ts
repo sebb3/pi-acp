@@ -3,6 +3,7 @@ import type {
   ContentBlock,
   McpServer,
   SessionUpdate,
+  Usage,
   ToolCallContent,
   ToolCallLocation,
   ToolKind
@@ -77,6 +78,12 @@ function compactAcpText(text: string, maxChars = MAX_ACP_TOOL_TEXT_CHARS): strin
   return `${text.slice(0, maxChars)}\n\n[pi-acp: truncated ${omitted} chars from ACP client payload; full output remains in the pi session.]`
 }
 
+function isAcpBridgeReadResult(value: unknown): boolean {
+  const details = (value as { details?: unknown } | null | undefined)?.details
+  const acpBridge = (details as { acpBridge?: unknown } | null | undefined)?.acpBridge
+  return (acpBridge as { source?: unknown } | null | undefined)?.source === 'fs.readTextFile'
+}
+
 function sanitizeAcpRawOutput(value: unknown): unknown {
   if (!value || typeof value !== 'object') return value
 
@@ -93,6 +100,30 @@ function sanitizeAcpRawOutput(value: unknown): unknown {
     return clone
   } catch {
     return { summary: '[pi-acp: raw tool output omitted from ACP payload]' }
+  }
+}
+
+function toPromptUsage(stats: any): Usage | undefined {
+  const tokens = stats?.tokens
+  if (!tokens || typeof tokens !== 'object') return undefined
+
+  const inputTokens = typeof tokens.input === 'number' ? tokens.input : 0
+  const outputTokens = typeof tokens.output === 'number' ? tokens.output : 0
+  const cachedReadTokens = typeof tokens.cacheRead === 'number' ? tokens.cacheRead : undefined
+  const cachedWriteTokens = typeof tokens.cacheWrite === 'number' ? tokens.cacheWrite : undefined
+  const thoughtTokens = typeof tokens.thought === 'number' ? tokens.thought : undefined
+  const totalTokens =
+    typeof tokens.total === 'number'
+      ? tokens.total
+      : inputTokens + outputTokens + (cachedReadTokens ?? 0) + (cachedWriteTokens ?? 0) + (thoughtTokens ?? 0)
+
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens,
+    ...(cachedReadTokens !== undefined ? { cachedReadTokens } : {}),
+    ...(cachedWriteTokens !== undefined ? { cachedWriteTokens } : {}),
+    ...(thoughtTokens !== undefined ? { thoughtTokens } : {})
   }
 }
 
@@ -312,6 +343,7 @@ export class PiAcpSession {
   private rawInputUpdateToolCallIds = new Set<string>()
   private bashToolCallIds = new Set<string>()
   private bashOutputSnapshots = new Map<string, string>()
+  private lastPromptUsage: Usage | undefined
 
   // Ensure `session/update` notifications are sent in order and can be awaited
   // before completing a `session/prompt` request.
@@ -455,6 +487,40 @@ export class PiAcpSession {
 
   private async flushEmits(): Promise<void> {
     await this.lastEmit
+  }
+
+  getLastPromptUsage(): Usage | undefined {
+    return this.lastPromptUsage
+  }
+
+  private async publishUsage(): Promise<void> {
+    let stats: any
+    try {
+      stats = await this.proc.getSessionStats()
+    } catch {
+      return
+    }
+
+    if (!stats || typeof stats !== 'object') return
+
+    this.lastPromptUsage = toPromptUsage(stats)
+
+    const contextUsage = stats.contextUsage
+    const size =
+      contextUsage && typeof contextUsage === 'object' && typeof contextUsage.contextWindow === 'number'
+        ? contextUsage.contextWindow
+        : undefined
+    if (size === undefined) return
+
+    const used = typeof contextUsage.tokens === 'number' ? contextUsage.tokens : 0
+    const cost = typeof stats.cost === 'number' ? { amount: stats.cost, currency: 'USD' } : undefined
+
+    this.emit({
+      sessionUpdate: 'usage_update',
+      used,
+      size,
+      ...(cost ? { cost } : {})
+    })
   }
 
   private emitBashToolCall(params: {
@@ -649,6 +715,8 @@ export class PiAcpSession {
           const toolCallId = String((toolCall as any)?.id ?? '')
           const toolName = String((toolCall as any)?.name ?? 'tool')
 
+          if (toolName === 'read') break
+
           if (toolCallId) {
             const rawInput =
               (toolCall as any)?.arguments && typeof (toolCall as any).arguments === 'object'
@@ -742,6 +810,7 @@ export class PiAcpSession {
         if (toolName === 'read') {
           const p = typeof args?.path === 'string' ? args.path : undefined
           if (p) this.readSnapshots.set(toolCallId, { path: p })
+          break
         }
 
         // Capture pre-edit file contents so we can emit a structured ACP diff on completion.
@@ -795,6 +864,7 @@ export class PiAcpSession {
         if (!toolCallId) break
 
         const partial = (ev as any).partialResult
+        if (this.readSnapshots.has(toolCallId)) break
         if (this.bashToolCallIds.has(toolCallId)) {
           this.emitBashOutputUpdate({ toolCallId, status: 'in_progress', result: partial })
           break
@@ -832,13 +902,27 @@ export class PiAcpSession {
         }
 
         const text = toolResultToText(result)
+        const readSnapshot = this.readSnapshots.get(toolCallId)
+
+        if (readSnapshot && isAcpBridgeReadResult(result)) {
+          this.emit({
+            sessionUpdate: 'tool_call',
+            toolCallId,
+            title: toolTitle('read', { path: readSnapshot.path }),
+            kind: 'read',
+            status: isError ? 'failed' : 'completed',
+            locations: toToolCallLocations({ path: readSnapshot.path }, this.cwd),
+            _meta: { piAcp: { source: 'fs.readTextFile' } }
+          })
+          this.cleanupToolCall(toolCallId)
+          break
+        }
 
         // If this was an edit and we captured a snapshot, emit a structured ACP diff.
         // This enables clients like Zed to render an actual diff UI.
         const snapshot = this.editSnapshots.get(toolCallId)
         let content: ToolCallContent[] | undefined
 
-        const readSnapshot = this.readSnapshots.get(toolCallId)
         if (!isError && readSnapshot && text) {
           content = readResourceContent(readSnapshot.path, this.cwd, text)
         }
@@ -870,6 +954,18 @@ export class PiAcpSession {
           content = [
             { type: 'content', content: { type: 'text', text: compactAcpText(text) } }
           ] satisfies ToolCallContent[]
+        }
+
+        if (readSnapshot && !this.currentToolCalls.has(toolCallId)) {
+          this.currentToolCalls.set(toolCallId, 'in_progress')
+          this.emit({
+            sessionUpdate: 'tool_call',
+            toolCallId,
+            title: toolTitle('read', { path: readSnapshot.path }),
+            kind: 'read',
+            status: isError ? 'failed' : 'completed',
+            locations: toToolCallLocations({ path: readSnapshot.path }, this.cwd)
+          })
         }
 
         this.emit({
@@ -935,33 +1031,36 @@ export class PiAcpSession {
 
       case 'agent_end': {
         // Ensure all updates derived from pi events are delivered before we resolve
-        // the ACP `session/prompt` request.
-        void this.flushEmits().finally(() => {
-          const reason: StopReason = this.cancelRequested ? 'cancelled' : 'end_turn'
-          const shouldAutoName = reason === 'end_turn' && this.completedTurnCount === 0
-          this.completedTurnCount += 1
+        // the ACP `session/prompt` request. Publish usage first so context/cost UI
+        // is current at turn end when pi can provide stats.
+        void this.publishUsage()
+          .then(() => this.flushEmits())
+          .finally(() => {
+            const reason: StopReason = this.cancelRequested ? 'cancelled' : 'end_turn'
+            const shouldAutoName = reason === 'end_turn' && this.completedTurnCount === 0
+            this.completedTurnCount += 1
 
-          this.pendingTurn?.resolve(reason)
-          this.pendingTurn = null
-          this.inAgentLoop = false
+            this.pendingTurn?.resolve(reason)
+            this.pendingTurn = null
+            this.inAgentLoop = false
 
-          // Start next queued prompt, if any.
-          const next = this.turnQueue.shift()
-          if (next) {
-            this.emit({
-              sessionUpdate: 'agent_message_chunk',
-              content: { type: 'text', text: `Starting queued message. (${this.turnQueue.length} remaining)` }
-            })
-            this.startTurn(next)
-          } else {
-            this.emit({
-              sessionUpdate: 'session_info_update',
-              _meta: { piAcp: { queueDepth: 0, running: false } }
-            })
-          }
+            // Start next queued prompt, if any.
+            const next = this.turnQueue.shift()
+            if (next) {
+              this.emit({
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: `Starting queued message. (${this.turnQueue.length} remaining)` }
+              })
+              this.startTurn(next)
+            } else {
+              this.emit({
+                sessionUpdate: 'session_info_update',
+                _meta: { piAcp: { queueDepth: 0, running: false } }
+              })
+            }
 
-          if (shouldAutoName) this.maybeAutoNameAfterFirstTurn()
-        })
+            if (shouldAutoName) this.maybeAutoNameAfterFirstTurn()
+          })
         break
       }
 

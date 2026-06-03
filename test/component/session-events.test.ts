@@ -172,7 +172,7 @@ test('PiAcpSession: falls back to text bash output when client lacks terminal_ou
   ])
 })
 
-test('PiAcpSession: emits tool locations from pi path args', async () => {
+test('PiAcpSession: emits delayed read tool locations from pi path args', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
 
@@ -186,10 +186,19 @@ test('PiAcpSession: emits tool locations from pi path args', async () => {
   })
 
   proc.emit({ type: 'tool_execution_start', toolCallId: 't1', toolName: 'read', args: { path: 'src/acp/session.ts' } })
+  await new Promise(r => setTimeout(r, 0))
+  assert.equal(conn.updates.length, 0)
+
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId: 't1',
+    isError: false,
+    result: { content: [{ type: 'text', text: 'content' }] }
+  })
 
   await new Promise(r => setTimeout(r, 0))
 
-  assert.equal(conn.updates.length, 1)
+  assert.equal(conn.updates.length, 2)
   assert.equal(conn.updates[0]!.update.sessionUpdate, 'tool_call')
   assert.equal((conn.updates[0]!.update as any).title, 'Read src/acp/session.ts')
   assert.deepEqual((conn.updates[0]!.update as any).locations, [{ path: `${process.cwd()}/src/acp/session.ts` }])
@@ -239,6 +248,51 @@ test('PiAcpSession: emits read results as embedded resources', async () => {
   assert.equal((conn.updates[1]!.update as any).rawOutput, undefined)
 })
 
+test('PiAcpSession: emits compact bridged read tool cards without raw input or output', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: {
+      type: 'toolcall_start',
+      toolCall: { id: 't1', name: 'read', arguments: { path: 'flake.nix' } }
+    }
+  })
+  proc.emit({ type: 'tool_execution_start', toolCallId: 't1', toolName: 'read', args: { path: 'flake.nix' } })
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId: 't1',
+    isError: false,
+    result: {
+      content: [{ type: 'text', text: 'editor buffer content' }],
+      details: { acpBridge: { source: 'fs.readTextFile' } }
+    }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 1)
+  assert.deepEqual(conn.updates[0]!.update, {
+    sessionUpdate: 'tool_call',
+    toolCallId: 't1',
+    title: 'Read flake.nix',
+    kind: 'read',
+    status: 'completed',
+    locations: [{ path: `${process.cwd()}/flake.nix` }],
+    _meta: { piAcp: { source: 'fs.readTextFile' } }
+  })
+})
+
 test('PiAcpSession: truncates large non-read raw tool output for ACP clients', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
@@ -286,28 +340,40 @@ test('PiAcpSession: suppresses repeated toolcall_delta ACP updates', async () =>
 
   proc.emit({
     type: 'message_update',
-    assistantMessageEvent: { type: 'toolcall_start', toolCall: { id: 't1', name: 'read', arguments: { path: 'a' } } }
+    assistantMessageEvent: {
+      type: 'toolcall_start',
+      toolCall: { id: 't1', name: 'fetch_content', arguments: { url: 'a' } }
+    }
   })
   proc.emit({
     type: 'message_update',
-    assistantMessageEvent: { type: 'toolcall_delta', toolCall: { id: 't1', name: 'read', arguments: { path: 'ab' } } }
+    assistantMessageEvent: {
+      type: 'toolcall_delta',
+      toolCall: { id: 't1', name: 'fetch_content', arguments: { url: 'ab' } }
+    }
   })
   proc.emit({
     type: 'message_update',
-    assistantMessageEvent: { type: 'toolcall_delta', toolCall: { id: 't1', name: 'read', arguments: { path: 'abc' } } }
+    assistantMessageEvent: {
+      type: 'toolcall_delta',
+      toolCall: { id: 't1', name: 'fetch_content', arguments: { url: 'abc' } }
+    }
   })
   proc.emit({
     type: 'message_update',
-    assistantMessageEvent: { type: 'toolcall_end', toolCall: { id: 't1', name: 'read', arguments: { path: 'abcd' } } }
+    assistantMessageEvent: {
+      type: 'toolcall_end',
+      toolCall: { id: 't1', name: 'fetch_content', arguments: { url: 'abcd' } }
+    }
   })
-  proc.emit({ type: 'tool_execution_start', toolCallId: 't1', toolName: 'read', args: { path: 'abcd' } })
+  proc.emit({ type: 'tool_execution_start', toolCallId: 't1', toolName: 'fetch_content', args: { url: 'abcd' } })
 
   await new Promise(r => setTimeout(r, 0))
 
   assert.equal(conn.updates.length, 3)
   assert.equal(conn.updates[0]!.update.sessionUpdate, 'tool_call')
   assert.equal(conn.updates[1]!.update.sessionUpdate, 'tool_call_update')
-  assert.deepEqual((conn.updates[1]!.update as any).rawInput, { path: 'abcd' })
+  assert.deepEqual((conn.updates[1]!.update as any).rawInput, { url: 'abcd' })
   assert.equal(conn.updates[2]!.update.sessionUpdate, 'tool_call_update')
   assert.equal((conn.updates[2]!.update as any).rawInput, undefined)
 })
@@ -635,6 +701,117 @@ test('PiAcpSession: prompt resolves end_turn on agent_end', async () => {
   proc.emit({ type: 'agent_end' })
   const reason = await p
   assert.equal(reason, 'end_turn')
+})
+
+test('PiAcpSession: emits usage_update on agent_end from session stats', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  proc.sessionStats = {
+    cost: 0.1234,
+    contextUsage: { tokens: 1500, contextWindow: 200000, percent: 0.75 }
+  }
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const p = session.prompt('hello')
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'agent_end' })
+  await p
+
+  const usage = conn.updates.find(u => u.update.sessionUpdate === 'usage_update')
+  assert.ok(usage, 'expected a usage_update notification')
+  assert.deepEqual(usage!.update, {
+    sessionUpdate: 'usage_update',
+    used: 1500,
+    size: 200000,
+    cost: { amount: 0.1234, currency: 'USD' }
+  })
+})
+
+test('PiAcpSession: usage_update omits cost and defaults used to 0 when tokens unavailable', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  proc.sessionStats = { contextUsage: { tokens: null, contextWindow: 200000, percent: null } }
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const p = session.prompt('hello')
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'agent_end' })
+  await p
+
+  const usage = conn.updates.find(u => u.update.sessionUpdate === 'usage_update')
+  assert.ok(usage, 'expected a usage_update notification')
+  assert.deepEqual(usage!.update, {
+    sessionUpdate: 'usage_update',
+    used: 0,
+    size: 200000
+  })
+})
+
+test('PiAcpSession: skips usage_update when no context window is known', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  proc.sessionStats = { cost: 0.5 }
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const p = session.prompt('hello')
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'agent_end' })
+  await p
+
+  assert.equal(
+    conn.updates.find(u => u.update.sessionUpdate === 'usage_update'),
+    undefined
+  )
+})
+
+test('PiAcpSession: agent_end still resolves when session stats are unavailable', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const p = session.prompt('hello')
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'agent_end' })
+  const reason = await p
+
+  assert.equal(reason, 'end_turn')
+  assert.equal(proc.getSessionStatsCount, 1)
+  assert.equal(
+    conn.updates.find(u => u.update.sessionUpdate === 'usage_update'),
+    undefined
+  )
 })
 
 test('PiAcpSession: re-emits startup info as the first chunk of the first prompt', async () => {
