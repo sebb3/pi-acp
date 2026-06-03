@@ -639,6 +639,15 @@ function sanitizeAcpRawOutput(value) {
     return { summary: "[pi-acp: raw tool output omitted from ACP payload]" };
   }
 }
+function bashOutputContent(text) {
+  if (!text) return void 0;
+  return [
+    {
+      type: "content",
+      content: { type: "text", text: compactAcpText("```console\n" + text.trimEnd() + "\n```") }
+    }
+  ];
+}
 function readResourceContent(path, cwd, text) {
   const absPath = isAbsolute(path) ? path : resolvePath(cwd, path);
   const uri = pathToFileURL(absPath).toString();
@@ -722,7 +731,8 @@ var SessionManager = class {
       proc,
       conn: params.conn,
       fileCommands: params.fileCommands ?? [],
-      piCommand: params.piCommand
+      piCommand: params.piCommand,
+      supportsTerminalOutput: params.supportsTerminalOutput
     });
     this.sessions.set(sessionId, session);
     return session;
@@ -746,7 +756,8 @@ var SessionManager = class {
       proc: params.proc,
       conn: params.conn,
       fileCommands: params.fileCommands ?? [],
-      piCommand: params.piCommand
+      piCommand: params.piCommand,
+      supportsTerminalOutput: params.supportsTerminalOutput
     });
     this.sessions.set(sessionId, session);
     return session;
@@ -763,6 +774,7 @@ var PiAcpSession = class {
   conn;
   fileCommands;
   piCommand;
+  supportsTerminalOutput;
   // Used to map abort semantics to ACP stopReason.
   // Applies to the currently running turn.
   cancelRequested = false;
@@ -796,6 +808,7 @@ var PiAcpSession = class {
     this.conn = opts.conn;
     this.fileCommands = opts.fileCommands ?? [];
     this.piCommand = opts.piCommand;
+    this.supportsTerminalOutput = opts.supportsTerminalOutput ?? true;
     this.proc.onEvent((ev) => this.handlePiEvent(ev));
   }
   setStartupInfo(text) {
@@ -897,14 +910,23 @@ var PiAcpSession = class {
     const previous = this.bashOutputSnapshots.get(params.toolCallId) ?? "";
     const delta = bashOutputDelta(previous, text);
     this.bashOutputSnapshots.set(params.toolCallId, text);
+    if (this.supportsTerminalOutput) {
+      this.emit({
+        sessionUpdate: "tool_call_update",
+        toolCallId: params.toolCallId,
+        status: params.status,
+        _meta: {
+          ...delta ? bashTerminalOutputMeta(params.toolCallId, delta) : {},
+          ...params.status === "completed" || params.status === "failed" ? bashTerminalExitMeta(params.toolCallId, bashExitCode(params.result, Boolean(params.isError))) : {}
+        }
+      });
+      return;
+    }
     this.emit({
       sessionUpdate: "tool_call_update",
       toolCallId: params.toolCallId,
       status: params.status,
-      _meta: {
-        ...delta ? bashTerminalOutputMeta(params.toolCallId, delta) : {},
-        ...params.status === "completed" || params.status === "failed" ? bashTerminalExitMeta(params.toolCallId, bashExitCode(params.result, Boolean(params.isError))) : {}
-      }
+      content: bashOutputContent(text)
     });
   }
   cleanupToolCall(toolCallId) {
@@ -1025,7 +1047,7 @@ var PiAcpSession = class {
                 args: rawInput,
                 status,
                 locations,
-                includeTerminal: !existingStatus
+                includeTerminal: this.supportsTerminalOutput && !existingStatus
               });
             } else if (!existingStatus) {
               this.currentToolCalls.set(toolCallId, "pending");
@@ -1068,7 +1090,7 @@ var PiAcpSession = class {
             args,
             status: "in_progress",
             locations: locations2,
-            includeTerminal: !existingStatus
+            includeTerminal: this.supportsTerminalOutput && !existingStatus
           });
           break;
         }
@@ -1172,7 +1194,9 @@ var PiAcpSession = class {
           }
         }
         if (!content && text) {
-          content = [{ type: "content", content: { type: "text", text: compactAcpText(text) } }];
+          content = [
+            { type: "content", content: { type: "text", text: compactAcpText(text) } }
+          ];
         }
         this.emit({
           sessionUpdate: "tool_call_update",
@@ -1803,6 +1827,7 @@ var PiAcpAgent = class {
   conn;
   sessions = new SessionManager();
   store = new SessionStore();
+  supportsTerminalOutput = false;
   dispose() {
     this.sessions.disposeAll();
   }
@@ -1873,12 +1898,14 @@ var PiAcpAgent = class {
       conn: this.conn,
       proc,
       fileCommands: loadSlashCommands(known.cwd),
-      piCommand: process.env.PI_ACP_PI_COMMAND
+      piCommand: process.env.PI_ACP_PI_COMMAND,
+      supportsTerminalOutput: this.supportsTerminalOutput
     });
     this.store.upsert({ sessionId, cwd: known.cwd, sessionFile: known.sessionFile });
     return session;
   }
   async initialize(params) {
+    this.supportsTerminalOutput = params?.clientCapabilities?._meta?.["terminal_output"] === true;
     const supportedVersion = 1;
     const requested = params.protocolVersion;
     return {
@@ -1921,7 +1948,8 @@ var PiAcpAgent = class {
       mcpServers: params.mcpServers,
       conn: this.conn,
       fileCommands,
-      piCommand: process.env.PI_ACP_PI_COMMAND
+      piCommand: process.env.PI_ACP_PI_COMMAND,
+      supportsTerminalOutput: this.supportsTerminalOutput
     });
     let state = null;
     let availableModels = null;
@@ -2466,8 +2494,8 @@ ${JSON.stringify(stats, null, 2)}`;
               title: bashCommand(m) ?? toolName,
               kind: "execute",
               status: "completed",
-              content: bashTerminalContent(toolCallId),
-              _meta: bashTerminalInfoMeta(toolCallId, params.cwd)
+              ...this.supportsTerminalOutput ? { content: bashTerminalContent(toolCallId) } : {},
+              ...this.supportsTerminalOutput ? { _meta: bashTerminalInfoMeta(toolCallId, params.cwd) } : {}
             }
           });
           await this.conn.sessionUpdate({
@@ -2476,9 +2504,20 @@ ${JSON.stringify(stats, null, 2)}`;
               sessionUpdate: "tool_call_update",
               toolCallId,
               status: isError ? "failed" : "completed",
-              _meta: {
-                ...text2 ? bashTerminalOutputMeta(toolCallId, text2) : {},
-                ...bashTerminalExitMeta(toolCallId, bashExitCode(m, isError))
+              ...this.supportsTerminalOutput ? {
+                _meta: {
+                  ...text2 ? bashTerminalOutputMeta(toolCallId, text2) : {},
+                  ...bashTerminalExitMeta(toolCallId, bashExitCode(m, isError))
+                }
+              } : {
+                content: text2 ? [
+                  {
+                    type: "content",
+                    content: { type: "text", text: `\`\`\`console
+${text2.trimEnd()}
+\`\`\`` }
+                  }
+                ] : void 0
               }
             }
           });

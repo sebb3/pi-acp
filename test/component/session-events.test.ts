@@ -124,6 +124,53 @@ test('PiAcpSession: emits tool_call + tool_call_update + completes', async () =>
   assert.equal((conn.updates[2]!.update as any).rawOutput, undefined)
 })
 
+test('PiAcpSession: falls back to text bash output when client lacks terminal_output support', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: [],
+    supportsTerminalOutput: false
+  })
+
+  proc.emit({ type: 'tool_execution_start', toolCallId: 't1', toolName: 'bash', args: { command: 'ls' } })
+  proc.emit({
+    type: 'tool_execution_update',
+    toolCallId: 't1',
+    partialResult: { content: [{ type: 'text', text: 'running' }] }
+  })
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId: 't1',
+    isError: false,
+    result: { content: [{ type: 'text', text: 'running\ndone' }] }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 3)
+  assert.equal(conn.updates[0]!.update.sessionUpdate, 'tool_call')
+  assert.equal((conn.updates[0]!.update as any).content, undefined)
+  assert.equal((conn.updates[0]!.update as any)._meta, undefined)
+
+  assert.equal(conn.updates[1]!.update.sessionUpdate, 'tool_call_update')
+  assert.equal((conn.updates[1]!.update as any)._meta, undefined)
+  assert.deepEqual((conn.updates[1]!.update as any).content, [
+    { type: 'content', content: { type: 'text', text: '```console\nrunning\n```' } }
+  ])
+
+  assert.equal(conn.updates[2]!.update.sessionUpdate, 'tool_call_update')
+  assert.equal((conn.updates[2]!.update as any)._meta, undefined)
+  assert.deepEqual((conn.updates[2]!.update as any).content, [
+    { type: 'content', content: { type: 'text', text: '```console\nrunning\ndone\n```' } }
+  ])
+})
+
 test('PiAcpSession: emits tool locations from pi path args', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()

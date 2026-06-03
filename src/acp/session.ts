@@ -34,6 +34,7 @@ type SessionCreateParams = {
   conn: AgentSideConnection
   fileCommands?: import('./slash-commands.js').FileSlashCommand[]
   piCommand?: string
+  supportsTerminalOutput?: boolean
 }
 
 export type StopReason = 'end_turn' | 'cancelled' | 'error'
@@ -92,6 +93,16 @@ function sanitizeAcpRawOutput(value: unknown): unknown {
   } catch {
     return { summary: '[pi-acp: raw tool output omitted from ACP payload]' }
   }
+}
+
+function bashOutputContent(text: string): ToolCallContent[] | undefined {
+  if (!text) return undefined
+  return [
+    {
+      type: 'content',
+      content: { type: 'text', text: compactAcpText('```console\n' + text.trimEnd() + '\n```') }
+    }
+  ] satisfies ToolCallContent[]
 }
 
 function readResourceContent(path: string, cwd: string, text: string): ToolCallContent[] {
@@ -196,7 +207,8 @@ export class SessionManager {
       proc,
       conn: params.conn,
       fileCommands: params.fileCommands ?? [],
-      piCommand: params.piCommand
+      piCommand: params.piCommand,
+      supportsTerminalOutput: params.supportsTerminalOutput
     })
 
     this.sessions.set(sessionId, session)
@@ -224,7 +236,8 @@ export class SessionManager {
       proc: params.proc,
       conn: params.conn,
       fileCommands: params.fileCommands ?? [],
-      piCommand: params.piCommand
+      piCommand: params.piCommand,
+      supportsTerminalOutput: params.supportsTerminalOutput
     })
 
     this.sessions.set(sessionId, session)
@@ -245,6 +258,7 @@ export class PiAcpSession {
   private readonly conn: AgentSideConnection
   private readonly fileCommands: FileSlashCommand[]
   private readonly piCommand?: string
+  private readonly supportsTerminalOutput: boolean
 
   // Used to map abort semantics to ACP stopReason.
   // Applies to the currently running turn.
@@ -284,6 +298,7 @@ export class PiAcpSession {
     conn: AgentSideConnection
     fileCommands?: FileSlashCommand[]
     piCommand?: string
+    supportsTerminalOutput?: boolean
   }) {
     this.sessionId = opts.sessionId
     this.cwd = opts.cwd
@@ -292,6 +307,7 @@ export class PiAcpSession {
     this.conn = opts.conn
     this.fileCommands = opts.fileCommands ?? []
     this.piCommand = opts.piCommand
+    this.supportsTerminalOutput = opts.supportsTerminalOutput ?? true
 
     this.proc.onEvent(ev => this.handlePiEvent(ev))
   }
@@ -447,16 +463,26 @@ export class PiAcpSession {
     const delta = bashOutputDelta(previous, text)
     this.bashOutputSnapshots.set(params.toolCallId, text)
 
+    if (this.supportsTerminalOutput) {
+      this.emit({
+        sessionUpdate: 'tool_call_update',
+        toolCallId: params.toolCallId,
+        status: params.status,
+        _meta: {
+          ...(delta ? bashTerminalOutputMeta(params.toolCallId, delta) : {}),
+          ...(params.status === 'completed' || params.status === 'failed'
+            ? bashTerminalExitMeta(params.toolCallId, bashExitCode(params.result, Boolean(params.isError)))
+            : {})
+        }
+      })
+      return
+    }
+
     this.emit({
       sessionUpdate: 'tool_call_update',
       toolCallId: params.toolCallId,
       status: params.status,
-      _meta: {
-        ...(delta ? bashTerminalOutputMeta(params.toolCallId, delta) : {}),
-        ...(params.status === 'completed' || params.status === 'failed'
-          ? bashTerminalExitMeta(params.toolCallId, bashExitCode(params.result, Boolean(params.isError)))
-          : {})
-      }
+      content: bashOutputContent(text)
     })
   }
 
@@ -622,7 +648,7 @@ export class PiAcpSession {
                 args: rawInput,
                 status,
                 locations,
-                includeTerminal: !existingStatus
+                includeTerminal: this.supportsTerminalOutput && !existingStatus
               })
             } else if (!existingStatus) {
               this.currentToolCalls.set(toolCallId, 'pending')
@@ -673,7 +699,7 @@ export class PiAcpSession {
             args,
             status: 'in_progress',
             locations,
-            includeTerminal: !existingStatus
+            includeTerminal: this.supportsTerminalOutput && !existingStatus
           })
           break
         }
@@ -805,7 +831,9 @@ export class PiAcpSession {
 
         // Fallback: just text content.
         if (!content && text) {
-          content = [{ type: 'content', content: { type: 'text', text: compactAcpText(text) } }] satisfies ToolCallContent[]
+          content = [
+            { type: 'content', content: { type: 'text', text: compactAcpText(text) } }
+          ] satisfies ToolCallContent[]
         }
 
         this.emit({

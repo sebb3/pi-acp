@@ -112,6 +112,7 @@ export class PiAcpAgent implements ACPAgent {
   private readonly conn: AgentSideConnection
   private readonly sessions = new SessionManager()
   private readonly store = new SessionStore()
+  private supportsTerminalOutput = false
 
   dispose(): void {
     this.sessions.disposeAll()
@@ -206,7 +207,8 @@ export class PiAcpAgent implements ACPAgent {
       conn: this.conn,
       proc,
       fileCommands: loadSlashCommands(known.cwd),
-      piCommand: process.env.PI_ACP_PI_COMMAND
+      piCommand: process.env.PI_ACP_PI_COMMAND,
+      supportsTerminalOutput: this.supportsTerminalOutput
     })
 
     this.store.upsert({ sessionId, cwd: known.cwd, sessionFile: known.sessionFile })
@@ -214,6 +216,8 @@ export class PiAcpAgent implements ACPAgent {
   }
 
   async initialize(params: InitializeRequest): Promise<InitializeResponse> {
+    this.supportsTerminalOutput = (params as any)?.clientCapabilities?._meta?.['terminal_output'] === true
+
     // We currently only support ACP protocol version 1.
     const supportedVersion = 1
     const requested = params.protocolVersion
@@ -263,7 +267,8 @@ export class PiAcpAgent implements ACPAgent {
       mcpServers: params.mcpServers,
       conn: this.conn,
       fileCommands,
-      piCommand: process.env.PI_ACP_PI_COMMAND
+      piCommand: process.env.PI_ACP_PI_COMMAND,
+      supportsTerminalOutput: this.supportsTerminalOutput
     })
 
     // Fetch state + models once (parallel) to reduce startup latency.
@@ -956,8 +961,8 @@ export class PiAcpAgent implements ACPAgent {
               title: bashCommand(m) ?? toolName,
               kind: 'execute',
               status: 'completed',
-              content: bashTerminalContent(toolCallId),
-              _meta: bashTerminalInfoMeta(toolCallId, params.cwd)
+              ...(this.supportsTerminalOutput ? { content: bashTerminalContent(toolCallId) } : {}),
+              ...(this.supportsTerminalOutput ? { _meta: bashTerminalInfoMeta(toolCallId, params.cwd) } : {})
             }
           })
 
@@ -967,10 +972,23 @@ export class PiAcpAgent implements ACPAgent {
               sessionUpdate: 'tool_call_update',
               toolCallId,
               status: isError ? 'failed' : 'completed',
-              _meta: {
-                ...(text ? bashTerminalOutputMeta(toolCallId, text) : {}),
-                ...bashTerminalExitMeta(toolCallId, bashExitCode(m, isError))
-              }
+              ...(this.supportsTerminalOutput
+                ? {
+                    _meta: {
+                      ...(text ? bashTerminalOutputMeta(toolCallId, text) : {}),
+                      ...bashTerminalExitMeta(toolCallId, bashExitCode(m, isError))
+                    }
+                  }
+                : {
+                    content: text
+                      ? [
+                          {
+                            type: 'content',
+                            content: { type: 'text', text: `\`\`\`console\n${text.trimEnd()}\n\`\`\`` }
+                          }
+                        ]
+                      : undefined
+                  })
             }
           })
           continue

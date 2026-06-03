@@ -39,6 +39,7 @@ test('PiAcpAgent: loadSession replays toolResult as tool_call + tool_call_update
     const agent = new PiAcpAgent(asAgentConn(conn))
     ;(agent as any).store = new FakeStore()
 
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: { _meta: { terminal_output: true } } } as any)
     await agent.loadSession({ sessionId: 's1', cwd: '/tmp/project', mcpServers: [] } as any)
 
     const updates = conn.updates.map(u => (u as any).update)
