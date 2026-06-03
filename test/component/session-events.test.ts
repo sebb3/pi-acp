@@ -294,13 +294,16 @@ test('PiAcpSession: suppresses repeated toolcall_delta ACP updates', async () =>
     type: 'message_update',
     assistantMessageEvent: { type: 'toolcall_end', toolCall: { id: 't1', name: 'read', arguments: { path: 'abcd' } } }
   })
+  proc.emit({ type: 'tool_execution_start', toolCallId: 't1', toolName: 'read', args: { path: 'abcd' } })
 
   await new Promise(r => setTimeout(r, 0))
 
-  assert.equal(conn.updates.length, 2)
+  assert.equal(conn.updates.length, 3)
   assert.equal(conn.updates[0]!.update.sessionUpdate, 'tool_call')
   assert.equal(conn.updates[1]!.update.sessionUpdate, 'tool_call_update')
   assert.deepEqual((conn.updates[1]!.update as any).rawInput, { path: 'abcd' })
+  assert.equal(conn.updates[2]!.update.sessionUpdate, 'tool_call_update')
+  assert.equal((conn.updates[2]!.update as any).rawInput, undefined)
 })
 
 test('PiAcpSession: emits agent_message_chunk for auto_retry_start with attempt/maxAttempts and rounded delay', async () => {

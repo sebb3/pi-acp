@@ -283,6 +283,7 @@ export class PiAcpSession {
   // Compatible format may need to be implemented in pi in the future.
   private editSnapshots = new Map<string, { path: string; oldText: string }>()
   private readSnapshots = new Map<string, { path: string }>()
+  private rawInputUpdateToolCallIds = new Set<string>()
   private bashToolCallIds = new Set<string>()
   private bashOutputSnapshots = new Map<string, string>()
 
@@ -486,10 +487,17 @@ export class PiAcpSession {
     })
   }
 
+  private rawInputForToolCallUpdate(toolCallId: string, rawInput: unknown): { rawInput?: unknown } {
+    if (this.rawInputUpdateToolCallIds.has(toolCallId)) return {}
+    this.rawInputUpdateToolCallIds.add(toolCallId)
+    return { rawInput }
+  }
+
   private cleanupToolCall(toolCallId: string): void {
     this.currentToolCalls.delete(toolCallId)
     this.editSnapshots.delete(toolCallId)
     this.readSnapshots.delete(toolCallId)
+    this.rawInputUpdateToolCallIds.delete(toolCallId)
     this.bashToolCallIds.delete(toolCallId)
     this.bashOutputSnapshots.delete(toolCallId)
   }
@@ -669,7 +677,7 @@ export class PiAcpSession {
                 toolCallId,
                 status,
                 locations,
-                rawInput
+                ...this.rawInputForToolCallUpdate(toolCallId, rawInput)
               })
             }
           }
@@ -747,7 +755,7 @@ export class PiAcpSession {
             toolCallId,
             status: 'in_progress',
             locations,
-            rawInput: args
+            ...this.rawInputForToolCallUpdate(toolCallId, args)
           })
         }
 

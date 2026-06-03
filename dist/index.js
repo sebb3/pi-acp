@@ -795,6 +795,7 @@ var PiAcpSession = class {
   // Compatible format may need to be implemented in pi in the future.
   editSnapshots = /* @__PURE__ */ new Map();
   readSnapshots = /* @__PURE__ */ new Map();
+  rawInputUpdateToolCallIds = /* @__PURE__ */ new Set();
   bashToolCallIds = /* @__PURE__ */ new Set();
   bashOutputSnapshots = /* @__PURE__ */ new Map();
   // Ensure `session/update` notifications are sent in order and can be awaited
@@ -929,10 +930,16 @@ var PiAcpSession = class {
       content: bashOutputContent(text)
     });
   }
+  rawInputForToolCallUpdate(toolCallId, rawInput) {
+    if (this.rawInputUpdateToolCallIds.has(toolCallId)) return {};
+    this.rawInputUpdateToolCallIds.add(toolCallId);
+    return { rawInput };
+  }
   cleanupToolCall(toolCallId) {
     this.currentToolCalls.delete(toolCallId);
     this.editSnapshots.delete(toolCallId);
     this.readSnapshots.delete(toolCallId);
+    this.rawInputUpdateToolCallIds.delete(toolCallId);
     this.bashToolCallIds.delete(toolCallId);
     this.bashOutputSnapshots.delete(toolCallId);
   }
@@ -1066,7 +1073,7 @@ var PiAcpSession = class {
                 toolCallId,
                 status,
                 locations,
-                rawInput
+                ...this.rawInputForToolCallUpdate(toolCallId, rawInput)
               });
             }
           }
@@ -1130,7 +1137,7 @@ var PiAcpSession = class {
             toolCallId,
             status: "in_progress",
             locations,
-            rawInput: args
+            ...this.rawInputForToolCallUpdate(toolCallId, args)
           });
         }
         break;
