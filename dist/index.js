@@ -356,6 +356,7 @@ var AgentSessionProcess = class _AgentSessionProcess {
     const createAgentSession = deps.createAgentSession ?? sdk.createAgentSession;
     const createReadToolDefinition = deps.createReadToolDefinition ?? sdk?.createReadToolDefinition;
     const createWriteToolDefinition = deps.createWriteToolDefinition ?? sdk?.createWriteToolDefinition;
+    const createEditToolDefinition = deps.createEditToolDefinition ?? sdk?.createEditToolDefinition;
     const sessionManager = params.sessionPath ? sdk?.SessionManager?.open(params.sessionPath, void 0, params.cwd) : void 0;
     const sessionIdRef = { current: "" };
     const customTools = [];
@@ -375,6 +376,16 @@ var AgentSessionProcess = class _AgentSessionProcess {
           cwd: params.cwd,
           conn: params.conn,
           createWriteToolDefinition,
+          getSessionId: () => sessionIdRef.current
+        })
+      );
+    }
+    if (createEditToolDefinition && shouldUseAcpEdit(params)) {
+      customTools.push(
+        createAcpEditToolDefinition({
+          cwd: params.cwd,
+          conn: params.conn,
+          createEditToolDefinition,
           getSessionId: () => sessionIdRef.current
         })
       );
@@ -521,6 +532,9 @@ function shouldUseAcpRead(params) {
 function shouldUseAcpWrite(params) {
   return Boolean(params.conn && params.clientCapabilities?.fs?.writeTextFile);
 }
+function shouldUseAcpEdit(params) {
+  return Boolean(params.conn && params.clientCapabilities?.fs?.readTextFile && params.clientCapabilities?.fs?.writeTextFile);
+}
 function createAcpReadToolDefinition(opts) {
   return opts.createReadToolDefinition(opts.cwd, {
     operations: {
@@ -537,6 +551,21 @@ function createAcpWriteToolDefinition(opts) {
   return opts.createWriteToolDefinition(opts.cwd, {
     operations: {
       mkdir: async (_dir) => {
+      },
+      writeFile: async (absolutePath, content) => {
+        await opts.conn.writeTextFile({ sessionId: opts.getSessionId(), path: absolutePath, content });
+      }
+    }
+  });
+}
+function createAcpEditToolDefinition(opts) {
+  return opts.createEditToolDefinition(opts.cwd, {
+    operations: {
+      access: async (_absolutePath) => {
+      },
+      readFile: async (absolutePath) => {
+        const result = await opts.conn.readTextFile({ sessionId: opts.getSessionId(), path: absolutePath });
+        return Buffer.from(result.content, "utf8");
       },
       writeFile: async (absolutePath, content) => {
         await opts.conn.writeTextFile({ sessionId: opts.getSessionId(), path: absolutePath, content });
@@ -1043,7 +1072,7 @@ var PiAcpSession = class {
     });
   }
   sendStartupInfoOnFirstPromptIfPending() {
-    if (this.startupInfoSentInPrompt || !this.startupInfo) return;
+    if (this.startupInfoSentInPrompt || this.startupInfoSentOutOfTurn || !this.startupInfo) return;
     this.startupInfoSentInPrompt = true;
     this.emit({
       sessionUpdate: "agent_message_chunk",
@@ -1221,6 +1250,7 @@ var PiAcpSession = class {
           break;
         }
         if (ame?.type === "toolcall_start" || ame?.type === "toolcall_delta" || ame?.type === "toolcall_end") {
+          if (ame?.type === "toolcall_delta") break;
           const toolCall = (
             // pi sometimes includes the tool call directly on the event
             ame?.toolCall ?? // ...and always includes it in the partial assistant message at contentIndex

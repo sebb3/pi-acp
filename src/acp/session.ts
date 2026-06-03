@@ -338,7 +338,7 @@ export class PiAcpSession {
   }
 
   private sendStartupInfoOnFirstPromptIfPending(): void {
-    if (this.startupInfoSentInPrompt || !this.startupInfo) return
+    if (this.startupInfoSentInPrompt || this.startupInfoSentOutOfTurn || !this.startupInfo) return
     this.startupInfoSentInPrompt = true
 
     this.emit({
@@ -604,6 +604,10 @@ export class PiAcpSession {
         // Surface tool calls ASAP so clients (e.g. Zed) can show a tool-in-use/loading UI
         // while the model is still streaming tool call args.
         if (ame?.type === 'toolcall_start' || ame?.type === 'toolcall_delta' || ame?.type === 'toolcall_end') {
+          // Avoid flooding the client with misleading partial JSON argument updates such as
+          // path="rig" -> "rigup" -> "rigup.toml" while the model streams tool args.
+          if (ame?.type === 'toolcall_delta') break
+
           const toolCall =
             // pi sometimes includes the tool call directly on the event
             (ame as any)?.toolCall ??

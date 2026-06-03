@@ -386,6 +386,50 @@ test('PiAcpSession: emits streamed tool locations from pi path args', async () =
   assert.deepEqual((conn.updates[0]!.update as any).locations, [{ path: '/tmp/test.txt' }])
 })
 
+test('PiAcpSession: ignores partial tool argument deltas to avoid noisy misleading locations', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: {
+      type: 'toolcall_start',
+      toolCall: { id: 't1', name: 'edit', arguments: {} }
+    }
+  })
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: {
+      type: 'toolcall_delta',
+      toolCall: { id: 't1', name: 'edit', arguments: { path: 'rig' } }
+    }
+  })
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: {
+      type: 'toolcall_end',
+      toolCall: { id: 't1', name: 'edit', arguments: { path: 'rigup.toml' } }
+    }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 2)
+  assert.equal(conn.updates[0]!.update.sessionUpdate, 'tool_call')
+  assert.equal((conn.updates[0]!.update as any).locations, undefined)
+  assert.equal(conn.updates[1]!.update.sessionUpdate, 'tool_call_update')
+  assert.deepEqual((conn.updates[1]!.update as any).locations, [{ path: `${process.cwd()}/rigup.toml` }])
+})
+
 test('PiAcpSession: emits edit tool line when oldText matches uniquely', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
@@ -471,7 +515,7 @@ test('PiAcpSession: prompt resolves end_turn on agent_end', async () => {
   assert.equal(reason, 'end_turn')
 })
 
-test('PiAcpSession: re-emits startup info as the first chunk of the first prompt', async () => {
+test('PiAcpSession: does not duplicate startup info on the first prompt after out-of-turn send', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
 
@@ -500,11 +544,7 @@ test('PiAcpSession: re-emits startup info as the first chunk of the first prompt
     sessionUpdate: 'agent_message_chunk',
     content: { type: 'text', text: notice }
   })
-  assert.equal(conn.updates[1]!.update.sessionUpdate, 'agent_message_chunk')
-  assert.deepEqual(conn.updates[1]!.update, {
-    sessionUpdate: 'agent_message_chunk',
-    content: { type: 'text', text: notice }
-  })
+  assert.equal(conn.updates.filter(u => (u.update as any).sessionUpdate === 'agent_message_chunk').length, 1)
 
   proc.emit({ type: 'agent_start' })
   proc.emit({ type: 'turn_end' })

@@ -44,11 +44,13 @@ type CreateAgentSession = (options: Record<string, unknown>) => Promise<{ sessio
 
 type CreateReadToolDefinition = (cwd: string, options?: Record<string, unknown>) => AgentToolLike
 type CreateWriteToolDefinition = (cwd: string, options?: Record<string, unknown>) => AgentToolLike
+type CreateEditToolDefinition = (cwd: string, options?: Record<string, unknown>) => AgentToolLike
 
 type PiSdkModule = {
   createAgentSession?: CreateAgentSession
   createReadToolDefinition?: CreateReadToolDefinition
   createWriteToolDefinition?: CreateWriteToolDefinition
+  createEditToolDefinition?: CreateEditToolDefinition
   SessionManager?: PiSessionManagerCtorLike
 }
 
@@ -56,6 +58,7 @@ type SpawnDeps = {
   createAgentSession?: CreateAgentSession
   createReadToolDefinition?: CreateReadToolDefinition
   createWriteToolDefinition?: CreateWriteToolDefinition
+  createEditToolDefinition?: CreateEditToolDefinition
 }
 
 type SpawnParams = {
@@ -83,6 +86,7 @@ export class AgentSessionProcess implements PiProcessLike {
     const createAgentSession = deps.createAgentSession ?? sdk!.createAgentSession!
     const createReadToolDefinition = deps.createReadToolDefinition ?? sdk?.createReadToolDefinition
     const createWriteToolDefinition = deps.createWriteToolDefinition ?? sdk?.createWriteToolDefinition
+    const createEditToolDefinition = deps.createEditToolDefinition ?? sdk?.createEditToolDefinition
     const sessionManager = params.sessionPath ? sdk?.SessionManager?.open(params.sessionPath, undefined, params.cwd) : undefined
     const sessionIdRef = { current: '' }
     const customTools: AgentToolLike[] = []
@@ -104,6 +108,17 @@ export class AgentSessionProcess implements PiProcessLike {
           cwd: params.cwd,
           conn: params.conn!,
           createWriteToolDefinition,
+          getSessionId: () => sessionIdRef.current
+        })
+      )
+    }
+
+    if (createEditToolDefinition && shouldUseAcpEdit(params)) {
+      customTools.push(
+        createAcpEditToolDefinition({
+          cwd: params.cwd,
+          conn: params.conn!,
+          createEditToolDefinition,
           getSessionId: () => sessionIdRef.current
         })
       )
@@ -280,6 +295,10 @@ function shouldUseAcpWrite(params: SpawnParams): boolean {
   return Boolean(params.conn && params.clientCapabilities?.fs?.writeTextFile)
 }
 
+function shouldUseAcpEdit(params: SpawnParams): boolean {
+  return Boolean(params.conn && params.clientCapabilities?.fs?.readTextFile && params.clientCapabilities?.fs?.writeTextFile)
+}
+
 function createAcpReadToolDefinition(opts: {
   cwd: string
   conn: AgentSideConnection
@@ -309,6 +328,28 @@ function createAcpWriteToolDefinition(opts: {
     operations: {
       mkdir: async (_dir: string) => {
         // ACP has no mkdir primitive; fs.writeTextFile is the client-owned write boundary.
+      },
+      writeFile: async (absolutePath: string, content: string) => {
+        await opts.conn.writeTextFile({ sessionId: opts.getSessionId(), path: absolutePath, content })
+      }
+    }
+  })
+}
+
+function createAcpEditToolDefinition(opts: {
+  cwd: string
+  conn: AgentSideConnection
+  createEditToolDefinition: CreateEditToolDefinition
+  getSessionId: () => string
+}): AgentToolLike {
+  return opts.createEditToolDefinition(opts.cwd, {
+    operations: {
+      access: async (_absolutePath: string) => {
+        // ACP read/write calls below will fail with the client's own error if unavailable.
+      },
+      readFile: async (absolutePath: string) => {
+        const result = await opts.conn.readTextFile({ sessionId: opts.getSessionId(), path: absolutePath })
+        return Buffer.from(result.content, 'utf8')
       },
       writeFile: async (absolutePath: string, content: string) => {
         await opts.conn.writeTextFile({ sessionId: opts.getSessionId(), path: absolutePath, content })
