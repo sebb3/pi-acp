@@ -3,7 +3,6 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { pathToFileURL } from 'node:url'
 import { PiAcpSession } from '../../src/acp/session.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
 
@@ -147,7 +146,7 @@ test('PiAcpSession: emits tool locations from pi path args', async () => {
   assert.deepEqual((conn.updates[0]!.update as any).locations, [{ path: `${process.cwd()}/src/acp/session.ts` }])
 })
 
-test('PiAcpSession: emits read results as embedded file resources', async () => {
+test('PiAcpSession: emits read results as compact client summaries', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
   const cwd = mkdtempSync(join(tmpdir(), 'pi-acp-read-resource-'))
@@ -179,15 +178,82 @@ test('PiAcpSession: emits read results as embedded file resources', async () => 
     {
       type: 'content',
       content: {
-        type: 'resource',
-        resource: {
-          uri: pathToFileURL(join(cwd, 'doc.md')).toString(),
-          mimeType: 'text/markdown',
-          text: '# Title\n'
-        }
+        type: 'text',
+        text: `Read ${join(cwd, 'doc.md')} (2 lines, 8 chars). Contents are hidden from ACP client payload; use the tool location or pi session if needed. file://${join(cwd, 'doc.md')}`
       }
     }
   ])
+  assert.equal((conn.updates[1]!.update as any).rawOutput, undefined)
+})
+
+test('PiAcpSession: truncates large non-read raw tool output for ACP clients', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const big = 'x'.repeat(9000)
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({ type: 'tool_execution_start', toolCallId: 't1', toolName: 'fetch_content', args: {} })
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId: 't1',
+    isError: false,
+    result: { content: [{ type: 'text', text: big }] }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  const update = conn.updates[1]!.update as any
+  assert.equal(update.sessionUpdate, 'tool_call_update')
+  assert.equal(update.content[0].content.text.startsWith('x'.repeat(8192)), true)
+  assert.equal(update.rawOutput.content[0].text.startsWith('x'.repeat(8192)), true)
+  assert.match(update.content[0].content.text, /truncated 808 chars/)
+  assert.match(update.rawOutput.content[0].text, /truncated 808 chars/)
+})
+
+test('PiAcpSession: suppresses repeated toolcall_delta ACP updates', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: { type: 'toolcall_start', toolCall: { id: 't1', name: 'read', arguments: { path: 'a' } } }
+  })
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: { type: 'toolcall_delta', toolCall: { id: 't1', name: 'read', arguments: { path: 'ab' } } }
+  })
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: { type: 'toolcall_delta', toolCall: { id: 't1', name: 'read', arguments: { path: 'abc' } } }
+  })
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: { type: 'toolcall_end', toolCall: { id: 't1', name: 'read', arguments: { path: 'abcd' } } }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 2)
+  assert.equal(conn.updates[0]!.update.sessionUpdate, 'tool_call')
+  assert.equal(conn.updates[1]!.update.sessionUpdate, 'tool_call_update')
+  assert.deepEqual((conn.updates[1]!.update as any).rawInput, { path: 'abcd' })
 })
 
 test('PiAcpSession: emits agent_message_chunk for auto_retry_start with attempt/maxAttempts and rounded delay', async () => {

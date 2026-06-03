@@ -79,7 +79,7 @@ function maybeAuthRequiredError(err) {
 
 // src/acp/session.ts
 import { readFileSync as readFileSync3 } from "fs";
-import { extname, isAbsolute, resolve as resolvePath } from "path";
+import { isAbsolute, resolve as resolvePath } from "path";
 import { pathToFileURL } from "url";
 
 // src/pi-rpc/process.ts
@@ -614,53 +614,42 @@ function findUniqueLineNumber(text, needle) {
   }
   return line;
 }
-function readMimeType(path) {
-  switch (extname(path).toLowerCase()) {
-    case ".md":
-    case ".markdown":
-      return "text/markdown";
-    case ".json":
-      return "application/json";
-    case ".jsonl":
-      return "application/x-ndjson";
-    case ".html":
-    case ".htm":
-      return "text/html";
-    case ".css":
-      return "text/css";
-    case ".js":
-    case ".mjs":
-    case ".cjs":
-      return "text/javascript";
-    case ".ts":
-    case ".mts":
-    case ".cts":
-      return "text/typescript";
-    case ".tsx":
-      return "text/tsx";
-    case ".jsx":
-      return "text/jsx";
-    case ".yaml":
-    case ".yml":
-      return "application/yaml";
-    case ".xml":
-      return "application/xml";
-    default:
-      return "text/plain";
+var MAX_ACP_TOOL_TEXT_CHARS = 8192;
+function compactAcpText(text, maxChars = MAX_ACP_TOOL_TEXT_CHARS) {
+  if (text.length <= maxChars) return text;
+  const omitted = text.length - maxChars;
+  return `${text.slice(0, maxChars)}
+
+[pi-acp: truncated ${omitted} chars from ACP client payload; full output remains in the pi session.]`;
+}
+function sanitizeAcpRawOutput(value) {
+  if (!value || typeof value !== "object") return value;
+  try {
+    const clone = JSON.parse(JSON.stringify(value));
+    if (Array.isArray(clone.content)) {
+      clone.content = clone.content.map((c) => {
+        if (c?.type === "text" && typeof c.text === "string") {
+          return { ...c, text: compactAcpText(c.text) };
+        }
+        return c;
+      });
+    }
+    return clone;
+  } catch {
+    return { summary: "[pi-acp: raw tool output omitted from ACP payload]" };
   }
 }
 function readResourceContent(path, cwd, text) {
   const absPath = isAbsolute(path) ? path : resolvePath(cwd, path);
+  const uri = pathToFileURL(absPath).toString();
+  const chars = text.length;
+  const lines = text.length ? text.split(/\r?\n/).length : 0;
   return [
     {
       type: "content",
       content: {
-        type: "resource",
-        resource: {
-          uri: pathToFileURL(absPath).toString(),
-          mimeType: readMimeType(absPath),
-          text
-        }
+        type: "text",
+        text: `Read ${absPath}${lines ? ` (${lines} lines, ${chars} chars)` : ""}. Contents are hidden from ACP client payload; use the tool location or pi session if needed. ${uri}`
       }
     }
   ];
@@ -1026,6 +1015,7 @@ var PiAcpSession = class {
             const locations = toToolCallLocations(rawInput, this.cwd);
             const existingStatus = this.currentToolCalls.get(toolCallId);
             const status = existingStatus ?? "pending";
+            if (ame?.type === "toolcall_delta" && existingStatus) break;
             if (isBashTool(toolName)) {
               if (!existingStatus) this.currentToolCalls.set(toolCallId, "pending");
               this.emitBashToolCall({
@@ -1136,8 +1126,8 @@ var PiAcpSession = class {
           sessionUpdate: "tool_call_update",
           toolCallId,
           status: "in_progress",
-          content: text ? [{ type: "content", content: { type: "text", text } }] : void 0,
-          rawOutput: partial
+          content: text ? [{ type: "content", content: { type: "text", text: compactAcpText(text) } }] : void 0,
+          rawOutput: sanitizeAcpRawOutput(partial)
         });
         break;
       }
@@ -1175,21 +1165,21 @@ var PiAcpSession = class {
                   oldText: snapshot.oldText,
                   newText
                 },
-                ...text ? [{ type: "content", content: { type: "text", text } }] : []
+                ...text ? [{ type: "content", content: { type: "text", text: compactAcpText(text) } }] : []
               ];
             }
           } catch {
           }
         }
         if (!content && text) {
-          content = [{ type: "content", content: { type: "text", text } }];
+          content = [{ type: "content", content: { type: "text", text: compactAcpText(text) } }];
         }
         this.emit({
           sessionUpdate: "tool_call_update",
           toolCallId,
           status: isError ? "failed" : "completed",
           content,
-          rawOutput: result
+          rawOutput: readSnapshot ? void 0 : sanitizeAcpRawOutput(result)
         });
         this.cleanupToolCall(toolCallId);
         break;

@@ -10,7 +10,7 @@ import type {
 import { RequestError } from '@agentclientprotocol/sdk'
 import { maybeAuthRequiredError } from './auth-required.js'
 import { readFileSync } from 'node:fs'
-import { extname, isAbsolute, resolve as resolvePath } from 'node:path'
+import { isAbsolute, resolve as resolvePath } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { PiRpcProcess, PiRpcSpawnError, type PiRpcEvent } from '../pi-rpc/process.js'
 import { SessionStore } from './session-store.js'
@@ -67,54 +67,45 @@ function findUniqueLineNumber(text: string, needle: string): number | undefined 
   return line
 }
 
-function readMimeType(path: string): string {
-  switch (extname(path).toLowerCase()) {
-    case '.md':
-    case '.markdown':
-      return 'text/markdown'
-    case '.json':
-      return 'application/json'
-    case '.jsonl':
-      return 'application/x-ndjson'
-    case '.html':
-    case '.htm':
-      return 'text/html'
-    case '.css':
-      return 'text/css'
-    case '.js':
-    case '.mjs':
-    case '.cjs':
-      return 'text/javascript'
-    case '.ts':
-    case '.mts':
-    case '.cts':
-      return 'text/typescript'
-    case '.tsx':
-      return 'text/tsx'
-    case '.jsx':
-      return 'text/jsx'
-    case '.yaml':
-    case '.yml':
-      return 'application/yaml'
-    case '.xml':
-      return 'application/xml'
-    default:
-      return 'text/plain'
+const MAX_ACP_TOOL_TEXT_CHARS = 8192
+
+function compactAcpText(text: string, maxChars = MAX_ACP_TOOL_TEXT_CHARS): string {
+  if (text.length <= maxChars) return text
+  const omitted = text.length - maxChars
+  return `${text.slice(0, maxChars)}\n\n[pi-acp: truncated ${omitted} chars from ACP client payload; full output remains in the pi session.]`
+}
+
+function sanitizeAcpRawOutput(value: unknown): unknown {
+  if (!value || typeof value !== 'object') return value
+
+  try {
+    const clone = JSON.parse(JSON.stringify(value))
+    if (Array.isArray(clone.content)) {
+      clone.content = clone.content.map((c: any) => {
+        if (c?.type === 'text' && typeof c.text === 'string') {
+          return { ...c, text: compactAcpText(c.text) }
+        }
+        return c
+      })
+    }
+    return clone
+  } catch {
+    return { summary: '[pi-acp: raw tool output omitted from ACP payload]' }
   }
 }
 
 function readResourceContent(path: string, cwd: string, text: string): ToolCallContent[] {
   const absPath = isAbsolute(path) ? path : resolvePath(cwd, path)
+  const uri = pathToFileURL(absPath).toString()
+  const chars = text.length
+  const lines = text.length ? text.split(/\r?\n/).length : 0
+
   return [
     {
       type: 'content',
       content: {
-        type: 'resource',
-        resource: {
-          uri: pathToFileURL(absPath).toString(),
-          mimeType: readMimeType(absPath),
-          text
-        }
+        type: 'text',
+        text: `Read ${absPath}${lines ? ` (${lines} lines, ${chars} chars)` : ''}. Contents are hidden from ACP client payload; use the tool location or pi session if needed. ${uri}`
       }
     }
   ] satisfies ToolCallContent[]
@@ -617,6 +608,11 @@ export class PiAcpSession {
             // IMPORTANT: never downgrade status (e.g. if we already marked in_progress via tool_execution_start).
             const status = existingStatus ?? 'pending'
 
+            // Tool-call argument deltas can be extremely chatty. Surface the tool
+            // card on start and the final args on end; execution events carry the
+            // actual status changes. This keeps ACP logs readable for long prompts.
+            if (ame?.type === 'toolcall_delta' && existingStatus) break
+
             if (isBashTool(toolName)) {
               if (!existingStatus) this.currentToolCalls.set(toolCallId, 'pending')
               this.emitBashToolCall({
@@ -749,9 +745,9 @@ export class PiAcpSession {
           toolCallId,
           status: 'in_progress',
           content: text
-            ? ([{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[])
+            ? ([{ type: 'content', content: { type: 'text', text: compactAcpText(text) } }] satisfies ToolCallContent[])
             : undefined,
-          rawOutput: partial
+          rawOutput: sanitizeAcpRawOutput(partial)
         })
         break
       }
@@ -797,7 +793,9 @@ export class PiAcpSession {
                   oldText: snapshot.oldText,
                   newText
                 },
-                ...(text ? ([{ type: 'content', content: { type: 'text', text } }] as ToolCallContent[]) : [])
+                ...(text
+                  ? ([{ type: 'content', content: { type: 'text', text: compactAcpText(text) } }] as ToolCallContent[])
+                  : [])
               ]
             }
           } catch {
@@ -807,7 +805,7 @@ export class PiAcpSession {
 
         // Fallback: just text content.
         if (!content && text) {
-          content = [{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[]
+          content = [{ type: 'content', content: { type: 'text', text: compactAcpText(text) } }] satisfies ToolCallContent[]
         }
 
         this.emit({
@@ -815,7 +813,7 @@ export class PiAcpSession {
           toolCallId,
           status: isError ? 'failed' : 'completed',
           content,
-          rawOutput: result
+          rawOutput: readSnapshot ? undefined : sanitizeAcpRawOutput(result)
         })
 
         this.cleanupToolCall(toolCallId)
