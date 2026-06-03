@@ -22,6 +22,7 @@ import {
 import { getAuthMethods } from './auth.js'
 import { SessionManager, type PiAcpSession } from './session.js'
 import { SessionStore } from './session-store.js'
+import { AcpBridgeServer } from './bridge.js'
 import { PiRpcProcess } from '../pi-rpc/process.js'
 import { listPiSessions, findPiSessionFile } from './pi-sessions.js'
 import { normalizePiAssistantText, normalizePiMessageText } from './translate/pi-messages.js'
@@ -112,10 +113,12 @@ export class PiAcpAgent implements ACPAgent {
   private readonly conn: AgentSideConnection
   private readonly sessions = new SessionManager()
   private readonly store = new SessionStore()
+  private readonly bridge: AcpBridgeServer
   private supportsTerminalOutput = false
 
   dispose(): void {
     this.sessions.disposeAll()
+    this.bridge.dispose()
   }
 
   // Remember recent session cwd and use it as the default filter.
@@ -123,6 +126,7 @@ export class PiAcpAgent implements ACPAgent {
 
   constructor(conn: AgentSideConnection, _config?: unknown) {
     this.conn = conn
+    this.bridge = new AcpBridgeServer(conn)
     void _config
   }
 
@@ -157,12 +161,13 @@ export class PiAcpAgent implements ACPAgent {
     }
   }
 
-  private async spawnPiSession(cwd: string, sessionFile: string): Promise<PiRpcProcess> {
+  private async spawnPiSession(cwd: string, sessionFile: string, env?: Record<string, string>): Promise<PiRpcProcess> {
     try {
       return await PiRpcProcess.spawn({
         cwd,
         sessionPath: sessionFile,
-        piCommand: process.env.PI_ACP_PI_COMMAND
+        piCommand: process.env.PI_ACP_PI_COMMAND,
+        env
       })
     } catch (e: any) {
       if (e?.name === 'PiRpcSpawnError') {
@@ -200,7 +205,8 @@ export class PiAcpAgent implements ACPAgent {
     if (!known) throw RequestError.invalidParams(`Unknown sessionId: ${sessionId}`)
     if (!isAbsolute(known.cwd)) throw RequestError.invalidParams(`cwd must be an absolute path: ${known.cwd}`)
 
-    const proc = await this.spawnPiSession(known.cwd, known.sessionFile)
+    const bridge = await this.bridge.prepareSession()
+    const proc = await this.spawnPiSession(known.cwd, known.sessionFile, bridge.env)
     const session = this.sessions.getOrCreate(sessionId, {
       cwd: known.cwd,
       mcpServers: (opts.mcpServers ?? []) as any,
@@ -211,6 +217,7 @@ export class PiAcpAgent implements ACPAgent {
       supportsTerminalOutput: this.supportsTerminalOutput
     })
 
+    this.bridge.attachSession(bridge.token, { sessionId: session.sessionId, cwd: known.cwd })
     this.store.upsert({ sessionId, cwd: known.cwd, sessionFile: known.sessionFile })
     return session
   }
@@ -261,6 +268,8 @@ export class PiAcpAgent implements ACPAgent {
     const fileCommands = loadSlashCommands(params.cwd)
     const enableSkillCommands = getEnableSkillCommands(params.cwd)
 
+    const bridge = await this.bridge.prepareSession()
+
     // Pi doesn't support mcpServers, but we accept and store.
     const session = await this.sessions.create({
       cwd: params.cwd,
@@ -268,8 +277,10 @@ export class PiAcpAgent implements ACPAgent {
       conn: this.conn,
       fileCommands,
       piCommand: process.env.PI_ACP_PI_COMMAND,
-      supportsTerminalOutput: this.supportsTerminalOutput
+      supportsTerminalOutput: this.supportsTerminalOutput,
+      bridgeEnv: bridge.env
     })
+    this.bridge.attachSession(bridge.token, { sessionId: session.sessionId, cwd: params.cwd })
 
     // Fetch state + models once (parallel) to reduce startup latency.
     let state: any = null

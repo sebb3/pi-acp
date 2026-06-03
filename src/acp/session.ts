@@ -35,6 +35,7 @@ type SessionCreateParams = {
   fileCommands?: import('./slash-commands.js').FileSlashCommand[]
   piCommand?: string
   supportsTerminalOutput?: boolean
+  bridgeEnv?: Record<string, string>
 }
 
 export type StopReason = 'end_turn' | 'cancelled' | 'error'
@@ -201,7 +202,8 @@ export class SessionManager {
     try {
       proc = await PiRpcProcess.spawn({
         cwd: params.cwd,
-        piCommand: params.piCommand
+        piCommand: params.piCommand,
+        env: params.bridgeEnv
       })
     } catch (e) {
       if (e instanceof PiRpcSpawnError) {

@@ -183,7 +183,7 @@ var PiRpcProcess = class _PiRpcProcess {
     const child = spawn(cmd, args, {
       cwd: params.cwd,
       stdio: "pipe",
-      env: process.env,
+      env: { ...process.env, ...params.env ?? {} },
       shell: shouldUseShellForPiCommand(cmd)
     });
     try {
@@ -743,7 +743,8 @@ var SessionManager = class {
     try {
       proc = await PiRpcProcess.spawn({
         cwd: params.cwd,
-        piCommand: params.piCommand
+        piCommand: params.piCommand,
+        env: params.bridgeEnv
       });
     } catch (e) {
       if (e instanceof PiRpcSpawnError) {
@@ -1416,10 +1417,118 @@ function toToolKind(toolName) {
   }
 }
 
+// src/acp/bridge.ts
+import { randomUUID } from "crypto";
+import { createServer } from "http";
+import { isAbsolute as isAbsolute2, resolve as resolvePath2 } from "path";
+var MAX_BODY_BYTES = 1024 * 1024;
+function randomToken() {
+  return randomUUID();
+}
+function asOptionalUint(value) {
+  if (value === void 0 || value === null) return void 0;
+  const n = Number(value);
+  return Number.isInteger(n) && n >= 0 ? n : void 0;
+}
+async function readBody(req) {
+  let body = "";
+  for await (const chunk of req) {
+    body += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+    if (body.length > MAX_BODY_BYTES) throw new Error("Request body too large");
+  }
+  return body ? JSON.parse(body) : null;
+}
+function sendJson(res, status, value) {
+  res.writeHead(status, { "content-type": "application/json" });
+  res.end(JSON.stringify(value));
+}
+var AcpBridgeServer = class {
+  constructor(conn) {
+    this.conn = conn;
+  }
+  server = null;
+  url = null;
+  sessions = /* @__PURE__ */ new Map();
+  async prepareSession() {
+    await this.ensureStarted();
+    const token = randomToken();
+    return {
+      token,
+      env: {
+        PI_ACP_BRIDGE_URL: this.url,
+        PI_ACP_BRIDGE_TOKEN: token
+      }
+    };
+  }
+  attachSession(token, session) {
+    this.sessions.set(token, session);
+  }
+  forgetSession(token) {
+    this.sessions.delete(token);
+  }
+  dispose() {
+    this.sessions.clear();
+    this.server?.close();
+    this.server = null;
+    this.url = null;
+  }
+  async ensureStarted() {
+    if (this.server && this.url) return;
+    const server = createServer((req, res) => {
+      void this.handle(req, res).catch((err) => {
+        sendJson(res, 500, { error: String(err?.message ?? err) });
+      });
+    });
+    await new Promise((resolve4, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => {
+        server.off("error", reject);
+        resolve4();
+      });
+    });
+    const addr = server.address();
+    if (!addr || typeof addr === "string") {
+      server.close();
+      throw new Error("Could not determine ACP bridge address");
+    }
+    server.unref();
+    this.server = server;
+    this.url = `http://127.0.0.1:${addr.port}`;
+  }
+  async handle(req, res) {
+    if (req.method !== "POST" || req.url !== "/fs/read_text_file") {
+      sendJson(res, 404, { error: "not found" });
+      return;
+    }
+    const token = String(req.headers["x-pi-acp-bridge-token"] ?? "");
+    const session = this.sessions.get(token);
+    if (!session) {
+      sendJson(res, 401, { error: "unauthorized" });
+      return;
+    }
+    const body = await readBody(req);
+    const rawPath = body?.path;
+    if (typeof rawPath !== "string" || !rawPath.trim()) {
+      sendJson(res, 400, { error: "path is required" });
+      return;
+    }
+    const path = isAbsolute2(rawPath) ? rawPath : resolvePath2(session.cwd, rawPath);
+    const line = asOptionalUint(body?.line);
+    const limit = asOptionalUint(body?.limit);
+    const result = await this.conn.readTextFile({
+      sessionId: session.sessionId,
+      path,
+      line,
+      limit
+    });
+    sendJson(res, 200, { content: result.content });
+  }
+};
+
 // src/acp/pi-sessions.ts
 import { readdirSync as readdirSync2, readFileSync as readFileSync4, statSync, openSync, readSync, closeSync, existsSync as existsSync2 } from "fs";
 import { homedir as homedir3 } from "os";
-import { join as join3, resolve as resolve2, isAbsolute as isAbsolute2 } from "path";
+import { join as join3, resolve as resolve2, isAbsolute as isAbsolute3 } from "path";
 var DEFAULT_TAIL_BYTES = 256 * 1024;
 var DEFAULT_HEAD_BYTES = 64 * 1024;
 function getPiAgentDir() {
@@ -1434,7 +1543,7 @@ function readSessionDirFromSettings(agentDir) {
     if (!data || typeof data !== "object" || Array.isArray(data)) return null;
     const sessionDir = data.sessionDir;
     if (typeof sessionDir !== "string" || !sessionDir.trim()) return null;
-    return isAbsolute2(sessionDir) ? sessionDir : resolve2(agentDir, sessionDir);
+    return isAbsolute3(sessionDir) ? sessionDir : resolve2(agentDir, sessionDir);
   } catch {
     return null;
   }
@@ -1818,7 +1927,7 @@ function toAvailableCommandsFromPiGetCommands(data, opts) {
 }
 
 // src/acp/agent.ts
-import { isAbsolute as isAbsolute3 } from "path";
+import { isAbsolute as isAbsolute4 } from "path";
 import { existsSync as existsSync4, readFileSync as readFileSync6, realpathSync, readdirSync as readdirSync3, statSync as statSync2, unlinkSync } from "fs";
 import { join as join5, dirname as dirname2, basename } from "path";
 import { spawnSync } from "child_process";
@@ -1879,14 +1988,17 @@ var PiAcpAgent = class {
   conn;
   sessions = new SessionManager();
   store = new SessionStore();
+  bridge;
   supportsTerminalOutput = false;
   dispose() {
     this.sessions.disposeAll();
+    this.bridge.dispose();
   }
   // Remember recent session cwd and use it as the default filter.
   lastSessionCwd = null;
   constructor(conn, _config) {
     this.conn = conn;
+    this.bridge = new AcpBridgeServer(conn);
     void _config;
   }
   cleanupFailedNewSession(sessionId, state) {
@@ -1910,12 +2022,13 @@ var PiAcpAgent = class {
       return null;
     }
   }
-  async spawnPiSession(cwd, sessionFile) {
+  async spawnPiSession(cwd, sessionFile, env) {
     try {
       return await PiRpcProcess.spawn({
         cwd,
         sessionPath: sessionFile,
-        piCommand: process.env.PI_ACP_PI_COMMAND
+        piCommand: process.env.PI_ACP_PI_COMMAND,
+        env
       });
     } catch (e) {
       if (e?.name === "PiRpcSpawnError") {
@@ -1942,8 +2055,9 @@ var PiAcpAgent = class {
     if (existing) return existing;
     const known = this.resolveKnownSession(sessionId, opts.cwd);
     if (!known) throw RequestError3.invalidParams(`Unknown sessionId: ${sessionId}`);
-    if (!isAbsolute3(known.cwd)) throw RequestError3.invalidParams(`cwd must be an absolute path: ${known.cwd}`);
-    const proc = await this.spawnPiSession(known.cwd, known.sessionFile);
+    if (!isAbsolute4(known.cwd)) throw RequestError3.invalidParams(`cwd must be an absolute path: ${known.cwd}`);
+    const bridge = await this.bridge.prepareSession();
+    const proc = await this.spawnPiSession(known.cwd, known.sessionFile, bridge.env);
     const session = this.sessions.getOrCreate(sessionId, {
       cwd: known.cwd,
       mcpServers: opts.mcpServers ?? [],
@@ -1953,6 +2067,7 @@ var PiAcpAgent = class {
       piCommand: process.env.PI_ACP_PI_COMMAND,
       supportsTerminalOutput: this.supportsTerminalOutput
     });
+    this.bridge.attachSession(bridge.token, { sessionId: session.sessionId, cwd: known.cwd });
     this.store.upsert({ sessionId, cwd: known.cwd, sessionFile: known.sessionFile });
     return session;
   }
@@ -1989,20 +2104,23 @@ var PiAcpAgent = class {
     };
   }
   async newSession(params) {
-    if (!isAbsolute3(params.cwd)) {
+    if (!isAbsolute4(params.cwd)) {
       throw RequestError3.invalidParams(`cwd must be an absolute path: ${params.cwd}`);
     }
     this.lastSessionCwd = params.cwd;
     const fileCommands = loadSlashCommands(params.cwd);
     const enableSkillCommands = getEnableSkillCommands(params.cwd);
+    const bridge = await this.bridge.prepareSession();
     const session = await this.sessions.create({
       cwd: params.cwd,
       mcpServers: params.mcpServers,
       conn: this.conn,
       fileCommands,
       piCommand: process.env.PI_ACP_PI_COMMAND,
-      supportsTerminalOutput: this.supportsTerminalOutput
+      supportsTerminalOutput: this.supportsTerminalOutput,
+      bridgeEnv: bridge.env
     });
+    this.bridge.attachSession(bridge.token, { sessionId: session.sessionId, cwd: params.cwd });
     let state = null;
     let availableModels = null;
     let stateErr = null;
@@ -2493,7 +2611,7 @@ ${JSON.stringify(stats, null, 2)}`;
     return { sessions, nextCursor, _meta: {} };
   }
   async loadSession(params) {
-    if (!isAbsolute3(params.cwd)) {
+    if (!isAbsolute4(params.cwd)) {
       throw RequestError3.invalidParams(`cwd must be an absolute path: ${params.cwd}`);
     }
     this.lastSessionCwd = params.cwd;

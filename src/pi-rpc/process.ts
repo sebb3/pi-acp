@@ -72,6 +72,8 @@ type SpawnParams = {
   sessionPath?: string
   /** If true, run pi without creating or attaching to a persisted session. */
   noSession?: boolean
+  /** Extra environment variables for the pi subprocess. */
+  env?: Record<string, string>
 }
 
 export class PiRpcProcess {
@@ -158,7 +160,7 @@ export class PiRpcProcess {
     const child = spawn(cmd, args, {
       cwd: params.cwd,
       stdio: 'pipe',
-      env: process.env,
+      env: { ...process.env, ...(params.env ?? {}) },
       shell: shouldUseShellForPiCommand(cmd)
     })
 
