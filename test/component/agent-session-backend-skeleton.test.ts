@@ -157,8 +157,11 @@ test('AgentSessionProcess: replaces read with an ACP-backed read tool when the c
       clientCapabilities: { fs: { readTextFile: true } }
     },
     {
-      createAgentSession: async () => ({ session: fakeSession }),
-      createReadTool: (_cwd, options) => {
+      createAgentSession: async options => {
+        assert.equal((options as any).customTools?.[0]?.source, 'acp')
+        return { session: fakeSession }
+      },
+      createReadToolDefinition: (_cwd, options) => {
         readOperations = options?.operations
         return { name: 'read', source: 'acp' } as any
       }
@@ -181,8 +184,11 @@ test('AgentSessionProcess: keeps native read when the client does not advertise 
       clientCapabilities: { fs: { readTextFile: false } }
     },
     {
-      createAgentSession: async () => ({ session: fakeSession }),
-      createReadTool: () => ({ name: 'read', source: 'acp' }) as any
+      createAgentSession: async options => {
+        assert.equal((options as any).customTools, undefined)
+        return { session: fakeSession }
+      },
+      createReadToolDefinition: () => ({ name: 'read', source: 'acp' }) as any
     }
   )
 

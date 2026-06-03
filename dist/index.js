@@ -354,19 +354,22 @@ var AgentSessionProcess = class _AgentSessionProcess {
   static async spawn(params, deps = {}) {
     const sdk = deps.createAgentSession ? null : await loadPiSdkModule();
     const createAgentSession = deps.createAgentSession ?? sdk.createAgentSession;
-    const createReadTool = deps.createReadTool ?? sdk?.createReadTool;
+    const createReadToolDefinition = deps.createReadToolDefinition ?? sdk?.createReadToolDefinition;
     const sessionManager = params.sessionPath ? sdk?.SessionManager?.open(params.sessionPath, void 0, params.cwd) : void 0;
+    const sessionIdRef = { current: "" };
+    const acpReadTool = createReadToolDefinition && shouldUseAcpRead(params) ? createAcpReadToolDefinition({
+      cwd: params.cwd,
+      conn: params.conn,
+      createReadToolDefinition,
+      getSessionId: () => sessionIdRef.current
+    }) : void 0;
     const result = await createAgentSession({
       cwd: params.cwd,
-      ...sessionManager ? { sessionManager } : {}
+      ...sessionManager ? { sessionManager } : {},
+      ...acpReadTool ? { customTools: [acpReadTool] } : {}
     });
-    if (createReadTool && shouldUseAcpRead(params)) {
-      installAcpReadTool(result.session, {
-        cwd: params.cwd,
-        conn: params.conn,
-        createReadTool
-      });
-    }
+    sessionIdRef.current = result.session.sessionId ?? "";
+    if (acpReadTool) installAcpReadTool(result.session, acpReadTool);
     return new _AgentSessionProcess(result.session);
   }
   onEvent(handler) {
@@ -499,20 +502,21 @@ async function loadPiSdkModule() {
 function shouldUseAcpRead(params) {
   return Boolean(params.conn && params.clientCapabilities?.fs?.readTextFile);
 }
-function installAcpReadTool(session, opts) {
-  const tools = session.agent?.state?.tools;
-  if (!Array.isArray(tools)) return;
-  const acpReadTool = opts.createReadTool(opts.cwd, {
+function createAcpReadToolDefinition(opts) {
+  return opts.createReadToolDefinition(opts.cwd, {
     operations: {
       access: async (_absolutePath) => {
       },
       readFile: async (absolutePath) => {
-        const sessionId = session.sessionId ?? "";
-        const result = await opts.conn.readTextFile({ sessionId, path: absolutePath });
+        const result = await opts.conn.readTextFile({ sessionId: opts.getSessionId(), path: absolutePath });
         return Buffer.from(result.content, "utf8");
       }
     }
   });
+}
+function installAcpReadTool(session, acpReadTool) {
+  const tools = session.agent?.state?.tools;
+  if (!Array.isArray(tools)) return;
   let replaced = false;
   session.agent.state.tools = tools.map((tool) => {
     if (tool?.name !== "read") return tool;

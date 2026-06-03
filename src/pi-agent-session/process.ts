@@ -42,17 +42,17 @@ type AgentSessionLike = {
 
 type CreateAgentSession = (options: Record<string, unknown>) => Promise<{ session: AgentSessionLike }>
 
-type CreateReadTool = (cwd: string, options?: Record<string, unknown>) => AgentToolLike
+type CreateReadToolDefinition = (cwd: string, options?: Record<string, unknown>) => AgentToolLike
 
 type PiSdkModule = {
   createAgentSession?: CreateAgentSession
-  createReadTool?: CreateReadTool
+  createReadToolDefinition?: CreateReadToolDefinition
   SessionManager?: PiSessionManagerCtorLike
 }
 
 type SpawnDeps = {
   createAgentSession?: CreateAgentSession
-  createReadTool?: CreateReadTool
+  createReadToolDefinition?: CreateReadToolDefinition
 }
 
 type SpawnParams = {
@@ -78,20 +78,26 @@ export class AgentSessionProcess implements PiProcessLike {
   static async spawn(params: SpawnParams, deps: SpawnDeps = {}): Promise<AgentSessionProcess> {
     const sdk = deps.createAgentSession ? null : await loadPiSdkModule()
     const createAgentSession = deps.createAgentSession ?? sdk!.createAgentSession!
-    const createReadTool = deps.createReadTool ?? sdk?.createReadTool
+    const createReadToolDefinition = deps.createReadToolDefinition ?? sdk?.createReadToolDefinition
     const sessionManager = params.sessionPath ? sdk?.SessionManager?.open(params.sessionPath, undefined, params.cwd) : undefined
+    const sessionIdRef = { current: '' }
+    const acpReadTool =
+      createReadToolDefinition && shouldUseAcpRead(params)
+        ? createAcpReadToolDefinition({
+            cwd: params.cwd,
+            conn: params.conn!,
+            createReadToolDefinition,
+            getSessionId: () => sessionIdRef.current
+          })
+        : undefined
     const result = await createAgentSession({
       cwd: params.cwd,
-      ...(sessionManager ? { sessionManager } : {})
+      ...(sessionManager ? { sessionManager } : {}),
+      ...(acpReadTool ? { customTools: [acpReadTool] } : {})
     })
 
-    if (createReadTool && shouldUseAcpRead(params)) {
-      installAcpReadTool(result.session, {
-        cwd: params.cwd,
-        conn: params.conn!,
-        createReadTool
-      })
-    }
+    sessionIdRef.current = result.session.sessionId ?? ''
+    if (acpReadTool) installAcpReadTool(result.session, acpReadTool)
 
     return new AgentSessionProcess(result.session)
   }
@@ -251,25 +257,28 @@ function shouldUseAcpRead(params: SpawnParams): boolean {
   return Boolean(params.conn && params.clientCapabilities?.fs?.readTextFile)
 }
 
-function installAcpReadTool(
-  session: AgentSessionLike,
-  opts: { cwd: string; conn: AgentSideConnection; createReadTool: CreateReadTool }
-): void {
-  const tools = session.agent?.state?.tools
-  if (!Array.isArray(tools)) return
-
-  const acpReadTool = opts.createReadTool(opts.cwd, {
+function createAcpReadToolDefinition(opts: {
+  cwd: string
+  conn: AgentSideConnection
+  createReadToolDefinition: CreateReadToolDefinition
+  getSessionId: () => string
+}): AgentToolLike {
+  return opts.createReadToolDefinition(opts.cwd, {
     operations: {
       access: async (_absolutePath: string) => {
         // ACP read will fail with the client's own error if the file is unavailable.
       },
       readFile: async (absolutePath: string) => {
-        const sessionId = session.sessionId ?? ''
-        const result = await opts.conn.readTextFile({ sessionId, path: absolutePath })
+        const result = await opts.conn.readTextFile({ sessionId: opts.getSessionId(), path: absolutePath })
         return Buffer.from(result.content, 'utf8')
       }
     }
   })
+}
+
+function installAcpReadTool(session: AgentSessionLike, acpReadTool: AgentToolLike): void {
+  const tools = session.agent?.state?.tools
+  if (!Array.isArray(tools)) return
 
   let replaced = false
   session.agent!.state!.tools = tools.map(tool => {
