@@ -9,3 +9,4 @@ dist
 
 /agentDocs
 .DS_Store
+dist/
