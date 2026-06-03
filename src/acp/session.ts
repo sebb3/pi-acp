@@ -10,7 +10,7 @@ import type {
 import { RequestError } from '@agentclientprotocol/sdk'
 import { maybeAuthRequiredError } from './auth-required.js'
 import { readFileSync } from 'node:fs'
-import { isAbsolute, resolve as resolvePath } from 'node:path'
+import { extname, isAbsolute, resolve as resolvePath } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { PiRpcProcess, PiRpcSpawnError, type PiRpcEvent } from '../pi-rpc/process.js'
 import { SessionStore } from './session-store.js'
@@ -107,19 +107,43 @@ function bashOutputContent(text: string): ToolCallContent[] | undefined {
 
 function readResourceContent(path: string, cwd: string, text: string): ToolCallContent[] {
   const absPath = isAbsolute(path) ? path : resolvePath(cwd, path)
-  const uri = pathToFileURL(absPath).toString()
-  const chars = text.length
-  const lines = text.length ? text.split(/\r?\n/).length : 0
-
   return [
     {
       type: 'content',
       content: {
-        type: 'text',
-        text: `Read ${absPath}${lines ? ` (${lines} lines, ${chars} chars)` : ''}. Contents are hidden from ACP client payload; use the tool location or pi session if needed. ${uri}`
+        type: 'resource',
+        resource: {
+          uri: pathToFileURL(absPath).toString(),
+          mimeType: mimeTypeForPath(absPath),
+          text: compactAcpText(text)
+        }
       }
     }
   ] satisfies ToolCallContent[]
+}
+
+function mimeTypeForPath(path: string): string {
+  switch (extname(path).toLowerCase()) {
+    case '.md':
+    case '.mdx':
+      return 'text/markdown'
+    case '.json':
+      return 'application/json'
+    case '.html':
+    case '.htm':
+      return 'text/html'
+    case '.css':
+      return 'text/css'
+    case '.js':
+    case '.mjs':
+    case '.cjs':
+      return 'text/javascript'
+    case '.ts':
+    case '.tsx':
+      return 'text/typescript'
+    default:
+      return 'text/plain'
+  }
 }
 
 function toToolCallLocations(args: unknown, cwd: string, line?: number): ToolCallLocation[] | undefined {
@@ -663,7 +687,7 @@ export class PiAcpSession {
               this.emit({
                 sessionUpdate: 'tool_call',
                 toolCallId,
-                title: toolName,
+                title: toolTitle(toolName, rawInput),
                 kind: toToolKind(toolName),
                 status,
                 locations,
@@ -676,6 +700,7 @@ export class PiAcpSession {
                 sessionUpdate: 'tool_call_update',
                 toolCallId,
                 status,
+                title: toolTitle(toolName, rawInput),
                 locations,
                 ...this.rawInputForToolCallUpdate(toolCallId, rawInput)
               })
@@ -742,7 +767,7 @@ export class PiAcpSession {
           this.emit({
             sessionUpdate: 'tool_call',
             toolCallId,
-            title: toolName,
+            title: toolTitle(toolName, args),
             kind: toToolKind(toolName),
             status: 'in_progress',
             locations,
@@ -754,6 +779,7 @@ export class PiAcpSession {
             sessionUpdate: 'tool_call_update',
             toolCallId,
             status: 'in_progress',
+            title: toolTitle(toolName, args),
             locations,
             ...this.rawInputForToolCallUpdate(toolCallId, args)
           })
@@ -1030,6 +1056,13 @@ function formatAutoRetryMessage(ev: PiRpcEvent): string {
   if (delayMs > 0 && delaySeconds === 0) delaySeconds = 1
 
   return `Retrying (attempt ${attempt}/${maxAttempts}, waiting ${delaySeconds}s)...`
+}
+
+function toolTitle(toolName: string, args: unknown): string {
+  const path =
+    typeof (args as { path?: unknown } | null | undefined)?.path === 'string' ? (args as { path: string }).path : ''
+  if (toolName === 'read' && path.trim()) return `Read ${path}`
+  return toolName
 }
 
 function toToolKind(toolName: string): ToolKind {

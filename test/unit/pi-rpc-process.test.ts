@@ -14,6 +14,46 @@ async function waitUntil(predicate: () => boolean): Promise<void> {
   assert.equal(predicate(), true)
 }
 
+test('PiRpcProcess.spawn: preserves U+2028 inside JSONL string values', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-rpc-u2028-'))
+  const scriptPath = join(root, 'fake-pi.cjs')
+
+  writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env node
+let buffered = ''
+process.stdin.resume()
+process.stdin.on('data', chunk => {
+  buffered += chunk.toString('utf8')
+  const lines = buffered.split(/\\n/)
+  buffered = lines.pop() || ''
+  for (const line of lines) {
+    if (!line.trim()) continue
+    const msg = JSON.parse(line)
+    process.stdout.write(JSON.stringify({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'before' + String.fromCharCode(0x2028) + 'after' } }) + '\\n')
+    process.stdout.write(JSON.stringify({ type: 'response', id: msg.id, command: msg.type, success: true, data: {} }) + '\\n')
+  }
+})
+`,
+    'utf8'
+  )
+  chmodSync(scriptPath, 0o755)
+
+  let proc: PiRpcProcess | null = null
+  try {
+    proc = await PiRpcProcess.spawn({ cwd: root, piCommand: scriptPath, noSession: true })
+    const events: any[] = []
+    proc.onEvent(ev => events.push(ev))
+
+    await proc.prompt('hello')
+    await waitUntil(() => events.length > 0)
+
+    assert.equal(events[0].assistantMessageEvent.delta, 'before' + String.fromCharCode(0x2028) + 'after')
+  } finally {
+    proc?.dispose()
+  }
+})
+
 test('PiRpcProcess.spawn: supports --no-session and get_last_assistant_text', async () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-acp-rpc-'))
   const argvPath = join(root, 'argv.json')

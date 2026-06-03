@@ -79,12 +79,12 @@ function maybeAuthRequiredError(err) {
 
 // src/acp/session.ts
 import { readFileSync as readFileSync3 } from "fs";
-import { isAbsolute, resolve as resolvePath } from "path";
+import { extname, isAbsolute, resolve as resolvePath } from "path";
 import { pathToFileURL } from "url";
 
 // src/pi-rpc/process.ts
 import { spawn } from "child_process";
-import * as readline from "readline";
+import { StringDecoder } from "string_decoder";
 
 // src/pi-rpc/command.ts
 import { platform } from "os";
@@ -127,8 +127,10 @@ var PiRpcProcess = class _PiRpcProcess {
   preludeLines = [];
   constructor(child) {
     this.child = child;
-    const rl = readline.createInterface({ input: child.stdout });
-    rl.on("line", (line) => {
+    const decoder = new StringDecoder("utf8");
+    let buf = "";
+    const onLine = (line) => {
+      if (line.endsWith("\r")) line = line.slice(0, -1);
       if (!line.trim()) return;
       let msg;
       try {
@@ -150,6 +152,18 @@ var PiRpcProcess = class _PiRpcProcess {
         }
       }
       for (const h of this.eventHandlers) h(msg);
+    };
+    child.stdout.on("data", (chunk) => {
+      buf += decoder.write(chunk);
+      let nl;
+      while ((nl = buf.indexOf("\n")) !== -1) {
+        onLine(buf.slice(0, nl));
+        buf = buf.slice(nl + 1);
+      }
+    });
+    child.stdout.on("end", () => {
+      buf += decoder.end();
+      if (buf.length > 0) onLine(buf);
     });
     child.on("exit", (code, signal) => {
       const err = new Error(`pi process exited (code=${code}, signal=${signal})`);
@@ -650,18 +664,42 @@ function bashOutputContent(text) {
 }
 function readResourceContent(path, cwd, text) {
   const absPath = isAbsolute(path) ? path : resolvePath(cwd, path);
-  const uri = pathToFileURL(absPath).toString();
-  const chars = text.length;
-  const lines = text.length ? text.split(/\r?\n/).length : 0;
   return [
     {
       type: "content",
       content: {
-        type: "text",
-        text: `Read ${absPath}${lines ? ` (${lines} lines, ${chars} chars)` : ""}. Contents are hidden from ACP client payload; use the tool location or pi session if needed. ${uri}`
+        type: "resource",
+        resource: {
+          uri: pathToFileURL(absPath).toString(),
+          mimeType: mimeTypeForPath(absPath),
+          text: compactAcpText(text)
+        }
       }
     }
   ];
+}
+function mimeTypeForPath(path) {
+  switch (extname(path).toLowerCase()) {
+    case ".md":
+    case ".mdx":
+      return "text/markdown";
+    case ".json":
+      return "application/json";
+    case ".html":
+    case ".htm":
+      return "text/html";
+    case ".css":
+      return "text/css";
+    case ".js":
+    case ".mjs":
+    case ".cjs":
+      return "text/javascript";
+    case ".ts":
+    case ".tsx":
+      return "text/typescript";
+    default:
+      return "text/plain";
+  }
 }
 function toToolCallLocations(args, cwd, line) {
   const path = typeof args?.path === "string" ? args.path : void 0;
@@ -1061,7 +1099,7 @@ var PiAcpSession = class {
               this.emit({
                 sessionUpdate: "tool_call",
                 toolCallId,
-                title: toolName,
+                title: toolTitle(toolName, rawInput),
                 kind: toToolKind(toolName),
                 status,
                 locations,
@@ -1072,6 +1110,7 @@ var PiAcpSession = class {
                 sessionUpdate: "tool_call_update",
                 toolCallId,
                 status,
+                title: toolTitle(toolName, rawInput),
                 locations,
                 ...this.rawInputForToolCallUpdate(toolCallId, rawInput)
               });
@@ -1124,7 +1163,7 @@ var PiAcpSession = class {
           this.emit({
             sessionUpdate: "tool_call",
             toolCallId,
-            title: toolName,
+            title: toolTitle(toolName, args),
             kind: toToolKind(toolName),
             status: "in_progress",
             locations,
@@ -1136,6 +1175,7 @@ var PiAcpSession = class {
             sessionUpdate: "tool_call_update",
             toolCallId,
             status: "in_progress",
+            title: toolTitle(toolName, args),
             locations,
             ...this.rawInputForToolCallUpdate(toolCallId, args)
           });
@@ -1356,6 +1396,11 @@ function formatAutoRetryMessage(ev) {
   let delaySeconds = Math.round(delayMs / 1e3);
   if (delayMs > 0 && delaySeconds === 0) delaySeconds = 1;
   return `Retrying (attempt ${attempt}/${maxAttempts}, waiting ${delaySeconds}s)...`;
+}
+function toolTitle(toolName, args) {
+  const path = typeof args?.path === "string" ? args.path : "";
+  if (toolName === "read" && path.trim()) return `Read ${path}`;
+  return toolName;
 }
 function toToolKind(toolName) {
   switch (toolName) {

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { PiAcpSession } from '../../src/acp/session.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
 
@@ -190,10 +191,11 @@ test('PiAcpSession: emits tool locations from pi path args', async () => {
 
   assert.equal(conn.updates.length, 1)
   assert.equal(conn.updates[0]!.update.sessionUpdate, 'tool_call')
+  assert.equal((conn.updates[0]!.update as any).title, 'Read src/acp/session.ts')
   assert.deepEqual((conn.updates[0]!.update as any).locations, [{ path: `${process.cwd()}/src/acp/session.ts` }])
 })
 
-test('PiAcpSession: emits read results as compact client summaries', async () => {
+test('PiAcpSession: emits read results as embedded resources', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
   const cwd = mkdtempSync(join(tmpdir(), 'pi-acp-read-resource-'))
@@ -225,8 +227,12 @@ test('PiAcpSession: emits read results as compact client summaries', async () =>
     {
       type: 'content',
       content: {
-        type: 'text',
-        text: `Read ${join(cwd, 'doc.md')} (2 lines, 8 chars). Contents are hidden from ACP client payload; use the tool location or pi session if needed. file://${join(cwd, 'doc.md')}`
+        type: 'resource',
+        resource: {
+          uri: pathToFileURL(join(cwd, 'doc.md')).toString(),
+          mimeType: 'text/markdown',
+          text: '# Title\n'
+        }
       }
     }
   ])
