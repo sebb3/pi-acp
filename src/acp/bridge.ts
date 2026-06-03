@@ -8,6 +8,7 @@ const MAX_BODY_BYTES = 1024 * 1024
 type BridgeSession = {
   sessionId: string
   cwd: string
+  additionalDirectories?: string[]
 }
 
 type ReadTextFileBody = {

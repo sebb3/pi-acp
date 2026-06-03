@@ -402,6 +402,7 @@ var SessionStore = class {
       sessionId: entry.sessionId,
       cwd: entry.cwd,
       sessionFile: entry.sessionFile,
+      ...entry.additionalDirectories?.length ? { additionalDirectories: entry.additionalDirectories } : {},
       updatedAt: (/* @__PURE__ */ new Date()).toISOString()
     };
     saveFile(this.path, db);
@@ -784,7 +785,12 @@ var SessionManager = class {
     const sessionId = typeof state?.sessionId === "string" ? state.sessionId : crypto.randomUUID();
     const sessionFile = typeof state?.sessionFile === "string" ? state.sessionFile : null;
     if (sessionFile) {
-      this.store.upsert({ sessionId, cwd: params.cwd, sessionFile });
+      this.store.upsert({
+        sessionId,
+        cwd: params.cwd,
+        sessionFile,
+        additionalDirectories: params.additionalDirectories
+      });
     }
     const session = new PiAcpSession({
       sessionId,
@@ -794,7 +800,8 @@ var SessionManager = class {
       conn: params.conn,
       fileCommands: params.fileCommands ?? [],
       piCommand: params.piCommand,
-      supportsTerminalOutput: params.supportsTerminalOutput
+      supportsTerminalOutput: params.supportsTerminalOutput,
+      additionalDirectories: params.additionalDirectories
     });
     this.sessions.set(sessionId, session);
     return session;
@@ -810,7 +817,10 @@ var SessionManager = class {
    */
   getOrCreate(sessionId, params) {
     const existing = this.sessions.get(sessionId);
-    if (existing) return existing;
+    if (existing) {
+      existing.setAdditionalDirectories(params.additionalDirectories ?? []);
+      return existing;
+    }
     const session = new PiAcpSession({
       sessionId,
       cwd: params.cwd,
@@ -819,7 +829,8 @@ var SessionManager = class {
       conn: params.conn,
       fileCommands: params.fileCommands ?? [],
       piCommand: params.piCommand,
-      supportsTerminalOutput: params.supportsTerminalOutput
+      supportsTerminalOutput: params.supportsTerminalOutput,
+      additionalDirectories: params.additionalDirectories
     });
     this.sessions.set(sessionId, session);
     return session;
@@ -829,6 +840,7 @@ var PiAcpSession = class {
   sessionId;
   cwd;
   mcpServers;
+  additionalDirectories;
   startupInfo = null;
   startupInfoSentOutOfTurn = false;
   startupInfoSentInPrompt = false;
@@ -868,6 +880,7 @@ var PiAcpSession = class {
     this.sessionId = opts.sessionId;
     this.cwd = opts.cwd;
     this.mcpServers = opts.mcpServers;
+    this.additionalDirectories = opts.additionalDirectories ?? [];
     this.proc = opts.proc;
     this.conn = opts.conn;
     this.fileCommands = opts.fileCommands ?? [];
@@ -900,6 +913,12 @@ var PiAcpSession = class {
       sessionUpdate: "agent_message_chunk",
       content: { type: "text", text: this.startupInfo }
     });
+  }
+  getAdditionalDirectories() {
+    return [...this.additionalDirectories];
+  }
+  setAdditionalDirectories(additionalDirectories) {
+    this.additionalDirectories = [...additionalDirectories];
   }
   async prompt(message, images = []) {
     this.sendStartupInfoOnFirstPromptIfPending();
@@ -2073,6 +2092,23 @@ function formatPercent(n) {
   if (!Number.isFinite(n)) return "0%";
   return `${Number.isInteger(n) ? n.toFixed(0) : n.toFixed(1)}%`;
 }
+function validateAdditionalDirectories(value, cwd) {
+  if (value === void 0) return [];
+  if (!Array.isArray(value))
+    throw RequestError3.invalidParams("additionalDirectories must be an array of absolute paths");
+  const out = [];
+  const seen = /* @__PURE__ */ new Set([cwd]);
+  for (const entry of value) {
+    if (typeof entry !== "string") throw RequestError3.invalidParams("additionalDirectories entries must be strings");
+    if (!entry.trim()) throw RequestError3.invalidParams("additionalDirectories entries must not be empty");
+    if (!isAbsolute4(entry))
+      throw RequestError3.invalidParams(`additionalDirectories entries must be absolute paths: ${entry}`);
+    if (seen.has(entry)) continue;
+    seen.add(entry);
+    out.push(entry);
+  }
+  return out;
+}
 function formatUsageStats(stats) {
   const lines = ["Usage"];
   const contextUsage = stats?.contextUsage;
@@ -2166,21 +2202,33 @@ var PiAcpAgent = class {
     const stored = this.store.get(sessionId);
     if (stored?.sessionFile) {
       const cwd2 = cwdHint ?? stored.cwd;
-      if (typeof cwd2 === "string" && cwd2.trim()) return { cwd: cwd2, sessionFile: stored.sessionFile };
+      if (typeof cwd2 === "string" && cwd2.trim()) {
+        return {
+          cwd: cwd2,
+          sessionFile: stored.sessionFile,
+          storedAdditionalDirectories: stored.additionalDirectories ?? []
+        };
+      }
     }
     const sessionFile = findPiSessionFile(sessionId);
     if (!sessionFile) return null;
     const piSession = listPiSessions().find((s) => s.sessionId === sessionId && s.sessionFile === sessionFile);
     const cwd = cwdHint ?? piSession?.cwd;
     if (typeof cwd !== "string" || !cwd.trim()) return null;
-    return { cwd, sessionFile };
+    return { cwd, sessionFile, storedAdditionalDirectories: [] };
   }
   async getOrReviveSession(sessionId, opts = {}) {
     const existing = this.getSessionIfPresent(sessionId);
-    if (existing) return existing;
+    if (existing) {
+      if (opts.additionalDirectories && typeof existing.setAdditionalDirectories === "function") {
+        existing.setAdditionalDirectories(opts.additionalDirectories);
+      }
+      return existing;
+    }
     const known = this.resolveKnownSession(sessionId, opts.cwd);
     if (!known) throw RequestError3.invalidParams(`Unknown sessionId: ${sessionId}`);
     if (!isAbsolute4(known.cwd)) throw RequestError3.invalidParams(`cwd must be an absolute path: ${known.cwd}`);
+    const additionalDirectories = opts.additionalDirectories ?? known.storedAdditionalDirectories;
     const bridge = await this.bridge.prepareSession();
     const proc = await this.spawnPiSession(known.cwd, known.sessionFile, bridge.env);
     const session = this.sessions.getOrCreate(sessionId, {
@@ -2190,10 +2238,15 @@ var PiAcpAgent = class {
       proc,
       fileCommands: loadSlashCommands(known.cwd),
       piCommand: process.env.PI_ACP_PI_COMMAND,
-      supportsTerminalOutput: this.supportsTerminalOutput
+      supportsTerminalOutput: this.supportsTerminalOutput,
+      additionalDirectories
     });
-    this.bridge.attachSession(bridge.token, { sessionId: session.sessionId, cwd: known.cwd });
-    this.store.upsert({ sessionId, cwd: known.cwd, sessionFile: known.sessionFile });
+    this.bridge.attachSession(bridge.token, {
+      sessionId: session.sessionId,
+      cwd: known.cwd,
+      additionalDirectories
+    });
+    this.store.upsert({ sessionId, cwd: known.cwd, sessionFile: known.sessionFile, additionalDirectories });
     return session;
   }
   async initialize(params) {
@@ -2223,7 +2276,10 @@ var PiAcpAgent = class {
         sessionCapabilities: {
           // **UNSTABLE** ACP capability used by Zed's codex-acp adapter.
           // Enables a native session picker in clients that support it.
-          list: {}
+          list: {},
+          // Enables multi-root Zed workspaces. Zed sends all workspace roots after
+          // the first as additionalDirectories when this capability is present.
+          additionalDirectories: {}
         }
       }
     };
@@ -2232,6 +2288,7 @@ var PiAcpAgent = class {
     if (!isAbsolute4(params.cwd)) {
       throw RequestError3.invalidParams(`cwd must be an absolute path: ${params.cwd}`);
     }
+    const additionalDirectories = validateAdditionalDirectories(params.additionalDirectories, params.cwd);
     this.lastSessionCwd = params.cwd;
     const fileCommands = loadSlashCommands(params.cwd);
     const enableSkillCommands = getEnableSkillCommands(params.cwd);
@@ -2243,9 +2300,14 @@ var PiAcpAgent = class {
       fileCommands,
       piCommand: process.env.PI_ACP_PI_COMMAND,
       supportsTerminalOutput: this.supportsTerminalOutput,
-      bridgeEnv: bridge.env
+      bridgeEnv: bridge.env,
+      additionalDirectories
     });
-    this.bridge.attachSession(bridge.token, { sessionId: session.sessionId, cwd: params.cwd });
+    this.bridge.attachSession(bridge.token, {
+      sessionId: session.sessionId,
+      cwd: params.cwd,
+      additionalDirectories
+    });
     let state = null;
     let availableModels = null;
     let stateErr = null;
@@ -2769,17 +2831,27 @@ ${JSON.stringify(stats, null, 2)}`;
   async unstable_listSessions(params) {
     const all = listPiSessions();
     const effectiveCwd = params.cwd ?? this.lastSessionCwd;
-    const filtered = effectiveCwd ? all.filter((s) => s.cwd === effectiveCwd) : all;
+    const additionalFilter = params.additionalDirectories;
+    const expectedAdditional = Array.isArray(additionalFilter) ? validateAdditionalDirectories(additionalFilter, effectiveCwd ?? "") : null;
+    const filtered = (effectiveCwd ? all.filter((s) => s.cwd === effectiveCwd) : all).filter((s) => {
+      if (!expectedAdditional?.length) return true;
+      const actual = this.store.get(s.sessionId)?.additionalDirectories ?? [];
+      return actual.length === expectedAdditional.length && actual.every((dir, i) => dir === expectedAdditional[i]);
+    });
     const offset = params.cursor ? Number.parseInt(params.cursor, 10) : 0;
     const start = Number.isFinite(offset) && offset > 0 ? offset : 0;
     const PAGE_SIZE = 50;
     const page = filtered.slice(start, start + PAGE_SIZE);
-    const sessions = page.map((s) => ({
-      sessionId: s.sessionId,
-      cwd: s.cwd,
-      title: s.title,
-      updatedAt: s.updatedAt
-    }));
+    const sessions = page.map((s) => {
+      const additionalDirectories = this.store.get(s.sessionId)?.additionalDirectories ?? [];
+      return {
+        sessionId: s.sessionId,
+        cwd: s.cwd,
+        ...additionalDirectories.length ? { additionalDirectories } : {},
+        title: s.title,
+        updatedAt: s.updatedAt
+      };
+    });
     const nextCursor = start + PAGE_SIZE < filtered.length ? String(start + PAGE_SIZE) : null;
     return { sessions, nextCursor, _meta: {} };
   }
@@ -2787,10 +2859,12 @@ ${JSON.stringify(stats, null, 2)}`;
     if (!isAbsolute4(params.cwd)) {
       throw RequestError3.invalidParams(`cwd must be an absolute path: ${params.cwd}`);
     }
+    const additionalDirectories = validateAdditionalDirectories(params.additionalDirectories, params.cwd);
     this.lastSessionCwd = params.cwd;
     const session = await this.getOrReviveSession(params.sessionId, {
       cwd: params.cwd,
-      mcpServers: params.mcpServers
+      mcpServers: params.mcpServers,
+      additionalDirectories
     });
     const proc = session.proc;
     const fileCommands = loadSlashCommands(params.cwd);

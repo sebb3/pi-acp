@@ -37,6 +37,7 @@ type SessionCreateParams = {
   piCommand?: string
   supportsTerminalOutput?: boolean
   bridgeEnv?: Record<string, string>
+  additionalDirectories?: string[]
 }
 
 export type StopReason = 'end_turn' | 'cancelled' | 'error'
@@ -254,7 +255,12 @@ export class SessionManager {
     const sessionFile = typeof state?.sessionFile === 'string' ? state.sessionFile : null
 
     if (sessionFile) {
-      this.store.upsert({ sessionId, cwd: params.cwd, sessionFile })
+      this.store.upsert({
+        sessionId,
+        cwd: params.cwd,
+        sessionFile,
+        additionalDirectories: params.additionalDirectories
+      })
     }
 
     const session = new PiAcpSession({
@@ -265,7 +271,8 @@ export class SessionManager {
       conn: params.conn,
       fileCommands: params.fileCommands ?? [],
       piCommand: params.piCommand,
-      supportsTerminalOutput: params.supportsTerminalOutput
+      supportsTerminalOutput: params.supportsTerminalOutput,
+      additionalDirectories: params.additionalDirectories
     })
 
     this.sessions.set(sessionId, session)
@@ -284,7 +291,10 @@ export class SessionManager {
    */
   getOrCreate(sessionId: string, params: SessionCreateParams & { proc: PiRpcProcess }): PiAcpSession {
     const existing = this.sessions.get(sessionId)
-    if (existing) return existing
+    if (existing) {
+      existing.setAdditionalDirectories(params.additionalDirectories ?? [])
+      return existing
+    }
 
     const session = new PiAcpSession({
       sessionId,
@@ -294,7 +304,8 @@ export class SessionManager {
       conn: params.conn,
       fileCommands: params.fileCommands ?? [],
       piCommand: params.piCommand,
-      supportsTerminalOutput: params.supportsTerminalOutput
+      supportsTerminalOutput: params.supportsTerminalOutput,
+      additionalDirectories: params.additionalDirectories
     })
 
     this.sessions.set(sessionId, session)
@@ -306,6 +317,7 @@ export class PiAcpSession {
   readonly sessionId: string
   readonly cwd: string
   readonly mcpServers: McpServer[]
+  private additionalDirectories: string[]
 
   private startupInfo: string | null = null
   private startupInfoSentOutOfTurn = false
@@ -358,10 +370,12 @@ export class PiAcpSession {
     fileCommands?: FileSlashCommand[]
     piCommand?: string
     supportsTerminalOutput?: boolean
+    additionalDirectories?: string[]
   }) {
     this.sessionId = opts.sessionId
     this.cwd = opts.cwd
     this.mcpServers = opts.mcpServers
+    this.additionalDirectories = opts.additionalDirectories ?? []
     this.proc = opts.proc
     this.conn = opts.conn
     this.fileCommands = opts.fileCommands ?? []
@@ -400,6 +414,14 @@ export class PiAcpSession {
       sessionUpdate: 'agent_message_chunk',
       content: { type: 'text', text: this.startupInfo }
     })
+  }
+
+  getAdditionalDirectories(): string[] {
+    return [...this.additionalDirectories]
+  }
+
+  setAdditionalDirectories(additionalDirectories: string[]): void {
+    this.additionalDirectories = [...additionalDirectories]
   }
 
   async prompt(message: string, images: unknown[] = []): Promise<StopReason> {

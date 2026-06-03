@@ -6,6 +6,7 @@ export type StoredSession = {
   sessionId: string
   cwd: string
   sessionFile: string
+  additionalDirectories?: string[]
   updatedAt: string
 }
 
@@ -48,12 +49,13 @@ export class SessionStore {
     return db.sessions[sessionId] ?? null
   }
 
-  upsert(entry: { sessionId: string; cwd: string; sessionFile: string }): void {
+  upsert(entry: { sessionId: string; cwd: string; sessionFile: string; additionalDirectories?: string[] }): void {
     const db = loadFile(this.path)
     db.sessions[entry.sessionId] = {
       sessionId: entry.sessionId,
       cwd: entry.cwd,
       sessionFile: entry.sessionFile,
+      ...(entry.additionalDirectories?.length ? { additionalDirectories: entry.additionalDirectories } : {}),
       updatedAt: new Date().toISOString()
     }
     saveFile(this.path, db)

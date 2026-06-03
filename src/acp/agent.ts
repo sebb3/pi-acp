@@ -145,6 +145,25 @@ function formatPercent(n: number): string {
   return `${Number.isInteger(n) ? n.toFixed(0) : n.toFixed(1)}%`
 }
 
+function validateAdditionalDirectories(value: unknown, cwd: string): string[] {
+  if (value === undefined) return []
+  if (!Array.isArray(value))
+    throw RequestError.invalidParams('additionalDirectories must be an array of absolute paths')
+
+  const out: string[] = []
+  const seen = new Set<string>([cwd])
+  for (const entry of value) {
+    if (typeof entry !== 'string') throw RequestError.invalidParams('additionalDirectories entries must be strings')
+    if (!entry.trim()) throw RequestError.invalidParams('additionalDirectories entries must not be empty')
+    if (!isAbsolute(entry))
+      throw RequestError.invalidParams(`additionalDirectories entries must be absolute paths: ${entry}`)
+    if (seen.has(entry)) continue
+    seen.add(entry)
+    out.push(entry)
+  }
+  return out
+}
+
 function formatUsageStats(stats: any): string {
   const lines: string[] = ['Usage']
 
@@ -261,11 +280,20 @@ export class PiAcpAgent implements ACPAgent {
     }
   }
 
-  private resolveKnownSession(sessionId: string, cwdHint?: string): { cwd: string; sessionFile: string } | null {
+  private resolveKnownSession(
+    sessionId: string,
+    cwdHint?: string
+  ): { cwd: string; sessionFile: string; storedAdditionalDirectories: string[] } | null {
     const stored = this.store.get(sessionId)
     if (stored?.sessionFile) {
       const cwd = cwdHint ?? stored.cwd
-      if (typeof cwd === 'string' && cwd.trim()) return { cwd, sessionFile: stored.sessionFile }
+      if (typeof cwd === 'string' && cwd.trim()) {
+        return {
+          cwd,
+          sessionFile: stored.sessionFile,
+          storedAdditionalDirectories: stored.additionalDirectories ?? []
+        }
+      }
     }
 
     const sessionFile = findPiSessionFile(sessionId)
@@ -275,19 +303,25 @@ export class PiAcpAgent implements ACPAgent {
     const cwd = cwdHint ?? piSession?.cwd
     if (typeof cwd !== 'string' || !cwd.trim()) return null
 
-    return { cwd, sessionFile }
+    return { cwd, sessionFile, storedAdditionalDirectories: [] }
   }
 
   private async getOrReviveSession(
     sessionId: string,
-    opts: { cwd?: string; mcpServers?: any[] } = {}
+    opts: { cwd?: string; mcpServers?: any[]; additionalDirectories?: string[] } = {}
   ): Promise<PiAcpSession> {
     const existing = this.getSessionIfPresent(sessionId)
-    if (existing) return existing
+    if (existing) {
+      if (opts.additionalDirectories && typeof (existing as any).setAdditionalDirectories === 'function') {
+        existing.setAdditionalDirectories(opts.additionalDirectories)
+      }
+      return existing
+    }
 
     const known = this.resolveKnownSession(sessionId, opts.cwd)
     if (!known) throw RequestError.invalidParams(`Unknown sessionId: ${sessionId}`)
     if (!isAbsolute(known.cwd)) throw RequestError.invalidParams(`cwd must be an absolute path: ${known.cwd}`)
+    const additionalDirectories = opts.additionalDirectories ?? known.storedAdditionalDirectories
 
     const bridge = await this.bridge.prepareSession()
     const proc = await this.spawnPiSession(known.cwd, known.sessionFile, bridge.env)
@@ -298,11 +332,16 @@ export class PiAcpAgent implements ACPAgent {
       proc,
       fileCommands: loadSlashCommands(known.cwd),
       piCommand: process.env.PI_ACP_PI_COMMAND,
-      supportsTerminalOutput: this.supportsTerminalOutput
+      supportsTerminalOutput: this.supportsTerminalOutput,
+      additionalDirectories
     })
 
-    this.bridge.attachSession(bridge.token, { sessionId: session.sessionId, cwd: known.cwd })
-    this.store.upsert({ sessionId, cwd: known.cwd, sessionFile: known.sessionFile })
+    this.bridge.attachSession(bridge.token, {
+      sessionId: session.sessionId,
+      cwd: known.cwd,
+      additionalDirectories
+    })
+    this.store.upsert({ sessionId, cwd: known.cwd, sessionFile: known.sessionFile, additionalDirectories })
     return session
   }
 
@@ -336,7 +375,10 @@ export class PiAcpAgent implements ACPAgent {
         sessionCapabilities: {
           // **UNSTABLE** ACP capability used by Zed's codex-acp adapter.
           // Enables a native session picker in clients that support it.
-          list: {}
+          list: {},
+          // Enables multi-root Zed workspaces. Zed sends all workspace roots after
+          // the first as additionalDirectories when this capability is present.
+          additionalDirectories: {}
         }
       }
     }
@@ -347,6 +389,7 @@ export class PiAcpAgent implements ACPAgent {
       throw RequestError.invalidParams(`cwd must be an absolute path: ${params.cwd}`)
     }
 
+    const additionalDirectories = validateAdditionalDirectories((params as any).additionalDirectories, params.cwd)
     this.lastSessionCwd = params.cwd
 
     const fileCommands = loadSlashCommands(params.cwd)
@@ -362,9 +405,14 @@ export class PiAcpAgent implements ACPAgent {
       fileCommands,
       piCommand: process.env.PI_ACP_PI_COMMAND,
       supportsTerminalOutput: this.supportsTerminalOutput,
-      bridgeEnv: bridge.env
+      bridgeEnv: bridge.env,
+      additionalDirectories
     })
-    this.bridge.attachSession(bridge.token, { sessionId: session.sessionId, cwd: params.cwd })
+    this.bridge.attachSession(bridge.token, {
+      sessionId: session.sessionId,
+      cwd: params.cwd,
+      additionalDirectories
+    })
 
     // Fetch state + models once (parallel) to reduce startup latency.
     let state: any = null
@@ -1023,7 +1071,15 @@ export class PiAcpAgent implements ACPAgent {
     const all = listPiSessions()
 
     const effectiveCwd = (params as any).cwd ?? this.lastSessionCwd
-    const filtered = effectiveCwd ? all.filter(s => s.cwd === effectiveCwd) : all
+    const additionalFilter = (params as any).additionalDirectories
+    const expectedAdditional = Array.isArray(additionalFilter)
+      ? validateAdditionalDirectories(additionalFilter, effectiveCwd ?? '')
+      : null
+    const filtered = (effectiveCwd ? all.filter(s => s.cwd === effectiveCwd) : all).filter(s => {
+      if (!expectedAdditional?.length) return true
+      const actual = this.store.get(s.sessionId)?.additionalDirectories ?? []
+      return actual.length === expectedAdditional.length && actual.every((dir, i) => dir === expectedAdditional[i])
+    })
 
     // Cursor-based pagination (opaque cursor). For MVP, we use a simple numeric offset.
     // If cursor is invalid, treat as 0.
@@ -1033,12 +1089,16 @@ export class PiAcpAgent implements ACPAgent {
     const PAGE_SIZE = 50
     const page = filtered.slice(start, start + PAGE_SIZE)
 
-    const sessions: SessionInfo[] = page.map(s => ({
-      sessionId: s.sessionId,
-      cwd: s.cwd,
-      title: s.title,
-      updatedAt: s.updatedAt
-    }))
+    const sessions: SessionInfo[] = page.map(s => {
+      const additionalDirectories = this.store.get(s.sessionId)?.additionalDirectories ?? []
+      return {
+        sessionId: s.sessionId,
+        cwd: s.cwd,
+        ...(additionalDirectories.length ? { additionalDirectories } : {}),
+        title: s.title,
+        updatedAt: s.updatedAt
+      }
+    })
 
     const nextCursor = start + PAGE_SIZE < filtered.length ? String(start + PAGE_SIZE) : null
 
@@ -1050,11 +1110,13 @@ export class PiAcpAgent implements ACPAgent {
       throw RequestError.invalidParams(`cwd must be an absolute path: ${params.cwd}`)
     }
 
+    const additionalDirectories = validateAdditionalDirectories((params as any).additionalDirectories, params.cwd)
     this.lastSessionCwd = params.cwd
 
     const session = await this.getOrReviveSession(params.sessionId, {
       cwd: params.cwd,
-      mcpServers: params.mcpServers
+      mcpServers: params.mcpServers,
+      additionalDirectories
     })
     const proc = session.proc
     const fileCommands = loadSlashCommands(params.cwd)
