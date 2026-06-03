@@ -42,26 +42,13 @@ type AgentSessionLike = {
 
 type CreateAgentSession = (options: Record<string, unknown>) => Promise<{ session: AgentSessionLike }>
 
-type CreateReadToolDefinition = (cwd: string, options?: Record<string, unknown>) => AgentToolLike
-type CreateWriteToolDefinition = (cwd: string, options?: Record<string, unknown>) => AgentToolLike
-type CreateEditToolDefinition = (cwd: string, options?: Record<string, unknown>) => AgentToolLike
-type CreateBashToolDefinition = (cwd: string, options?: Record<string, unknown>) => AgentToolLike
-
 type PiSdkModule = {
   createAgentSession?: CreateAgentSession
-  createReadToolDefinition?: CreateReadToolDefinition
-  createWriteToolDefinition?: CreateWriteToolDefinition
-  createEditToolDefinition?: CreateEditToolDefinition
-  createBashToolDefinition?: CreateBashToolDefinition
   SessionManager?: PiSessionManagerCtorLike
 }
 
 type SpawnDeps = {
   createAgentSession?: CreateAgentSession
-  createReadToolDefinition?: CreateReadToolDefinition
-  createWriteToolDefinition?: CreateWriteToolDefinition
-  createEditToolDefinition?: CreateEditToolDefinition
-  createBashToolDefinition?: CreateBashToolDefinition
 }
 
 type SpawnParams = {
@@ -87,66 +74,11 @@ export class AgentSessionProcess implements PiProcessLike {
   static async spawn(params: SpawnParams, deps: SpawnDeps = {}): Promise<AgentSessionProcess> {
     const sdk = deps.createAgentSession ? null : await loadPiSdkModule()
     const createAgentSession = deps.createAgentSession ?? sdk!.createAgentSession!
-    const createReadToolDefinition = deps.createReadToolDefinition ?? sdk?.createReadToolDefinition
-    const createWriteToolDefinition = deps.createWriteToolDefinition ?? sdk?.createWriteToolDefinition
-    const createEditToolDefinition = deps.createEditToolDefinition ?? sdk?.createEditToolDefinition
-    const createBashToolDefinition = deps.createBashToolDefinition ?? sdk?.createBashToolDefinition
     const sessionManager = params.sessionPath ? sdk?.SessionManager?.open(params.sessionPath, undefined, params.cwd) : undefined
-    const sessionIdRef = { current: '' }
-    const customTools: AgentToolLike[] = []
-
-    if (createReadToolDefinition && shouldUseAcpRead(params)) {
-      customTools.push(
-        createAcpReadToolDefinition({
-          cwd: params.cwd,
-          conn: params.conn!,
-          createReadToolDefinition,
-          getSessionId: () => sessionIdRef.current
-        })
-      )
-    }
-
-    if (createWriteToolDefinition && shouldUseAcpWrite(params)) {
-      customTools.push(
-        createAcpWriteToolDefinition({
-          cwd: params.cwd,
-          conn: params.conn!,
-          createWriteToolDefinition,
-          getSessionId: () => sessionIdRef.current
-        })
-      )
-    }
-
-    if (createEditToolDefinition && shouldUseAcpEdit(params)) {
-      customTools.push(
-        createAcpEditToolDefinition({
-          cwd: params.cwd,
-          conn: params.conn!,
-          createEditToolDefinition,
-          getSessionId: () => sessionIdRef.current
-        })
-      )
-    }
-
-    if (createBashToolDefinition && shouldUseAcpTerminal(params)) {
-      customTools.push(
-        createAcpBashToolDefinition({
-          cwd: params.cwd,
-          conn: params.conn!,
-          createBashToolDefinition,
-          getSessionId: () => sessionIdRef.current
-        })
-      )
-    }
-
     const result = await createAgentSession({
       cwd: params.cwd,
-      ...(sessionManager ? { sessionManager } : {}),
-      ...(customTools.length > 0 ? { customTools } : {})
+      ...(sessionManager ? { sessionManager } : {})
     })
-
-    sessionIdRef.current = result.session.sessionId ?? ''
-    for (const customTool of customTools) installAcpTool(result.session, customTool)
 
     return new AgentSessionProcess(result.session)
   }
@@ -300,183 +232,6 @@ async function loadPiSdkModule(): Promise<Required<Pick<PiSdkModule, 'createAgen
     throw new Error(`${PI_PACKAGE} does not export createAgentSession`)
   }
   return mod as Required<Pick<PiSdkModule, 'createAgentSession'>> & PiSdkModule
-}
-
-function shouldUseAcpRead(params: SpawnParams): boolean {
-  return Boolean(params.conn && params.clientCapabilities?.fs?.readTextFile)
-}
-
-function shouldUseAcpWrite(params: SpawnParams): boolean {
-  return Boolean(params.conn && params.clientCapabilities?.fs?.writeTextFile)
-}
-
-function shouldUseAcpEdit(params: SpawnParams): boolean {
-  return Boolean(params.conn && params.clientCapabilities?.fs?.readTextFile && params.clientCapabilities?.fs?.writeTextFile)
-}
-
-function shouldUseAcpTerminal(params: SpawnParams): boolean {
-  return Boolean(params.conn && params.clientCapabilities?.terminal)
-}
-
-function createAcpReadToolDefinition(opts: {
-  cwd: string
-  conn: AgentSideConnection
-  createReadToolDefinition: CreateReadToolDefinition
-  getSessionId: () => string
-}): AgentToolLike {
-  return opts.createReadToolDefinition(opts.cwd, {
-    operations: {
-      access: async (_absolutePath: string) => {
-        // ACP read will fail with the client's own error if the file is unavailable.
-      },
-      readFile: async (absolutePath: string) => {
-        const result = await opts.conn.readTextFile({ sessionId: opts.getSessionId(), path: absolutePath })
-        return Buffer.from(result.content, 'utf8')
-      }
-    }
-  })
-}
-
-function createAcpWriteToolDefinition(opts: {
-  cwd: string
-  conn: AgentSideConnection
-  createWriteToolDefinition: CreateWriteToolDefinition
-  getSessionId: () => string
-}): AgentToolLike {
-  return opts.createWriteToolDefinition(opts.cwd, {
-    operations: {
-      mkdir: async (_dir: string) => {
-        // ACP has no mkdir primitive; fs.writeTextFile is the client-owned write boundary.
-      },
-      writeFile: async (absolutePath: string, content: string) => {
-        await opts.conn.writeTextFile({ sessionId: opts.getSessionId(), path: absolutePath, content })
-      }
-    }
-  })
-}
-
-function createAcpEditToolDefinition(opts: {
-  cwd: string
-  conn: AgentSideConnection
-  createEditToolDefinition: CreateEditToolDefinition
-  getSessionId: () => string
-}): AgentToolLike {
-  return opts.createEditToolDefinition(opts.cwd, {
-    operations: {
-      access: async (_absolutePath: string) => {
-        // ACP read/write calls below will fail with the client's own error if unavailable.
-      },
-      readFile: async (absolutePath: string) => {
-        const result = await opts.conn.readTextFile({ sessionId: opts.getSessionId(), path: absolutePath })
-        return Buffer.from(result.content, 'utf8')
-      },
-      writeFile: async (absolutePath: string, content: string) => {
-        await opts.conn.writeTextFile({ sessionId: opts.getSessionId(), path: absolutePath, content })
-      }
-    }
-  })
-}
-
-function createAcpBashToolDefinition(opts: {
-  cwd: string
-  conn: AgentSideConnection
-  createBashToolDefinition: CreateBashToolDefinition
-  getSessionId: () => string
-}): AgentToolLike {
-  return opts.createBashToolDefinition(opts.cwd, {
-    operations: {
-      exec: async (
-        command: string,
-        cwd: string,
-        options: { onData: (data: Buffer) => void; signal?: AbortSignal; timeout?: number; env?: NodeJS.ProcessEnv }
-      ) => runAcpTerminalCommand({ ...opts, command, cwd, options })
-    }
-  })
-}
-
-async function runAcpTerminalCommand(opts: {
-  conn: AgentSideConnection
-  getSessionId: () => string
-  command: string
-  cwd: string
-  options: { onData: (data: Buffer) => void; signal?: AbortSignal; timeout?: number; env?: NodeJS.ProcessEnv }
-}): Promise<{ exitCode: number | null }> {
-  if (opts.options.signal?.aborted) throw new Error('aborted')
-
-  const shell = process.env.SHELL || '/bin/bash'
-  const env = Object.entries(opts.options.env ?? {})
-    .filter((entry): entry is [string, string] => typeof entry[1] === 'string')
-    .map(([name, value]) => ({ name, value }))
-  const terminal = await opts.conn.createTerminal({
-    sessionId: opts.getSessionId(),
-    command: shell,
-    args: ['-lc', opts.command],
-    cwd: opts.cwd,
-    env,
-    outputByteLimit: 1024 * 1024
-  })
-
-  let lastOutput = ''
-  let finished = false
-  let timedOut = false
-  let timeoutHandle: NodeJS.Timeout | undefined
-
-  const emitOutputDelta = async () => {
-    const output = await terminal.currentOutput()
-    if (output.output.startsWith(lastOutput)) {
-      const delta = output.output.slice(lastOutput.length)
-      if (delta) opts.options.onData(Buffer.from(delta, 'utf8'))
-    } else if (output.output) {
-      opts.options.onData(Buffer.from(output.output, 'utf8'))
-    }
-    lastOutput = output.output
-  }
-
-  const interval = setInterval(() => {
-    if (!finished) emitOutputDelta().catch(() => undefined)
-  }, 100)
-  const abort = () => {
-    terminal.kill().catch(() => undefined)
-  }
-
-  try {
-    if (opts.options.timeout && opts.options.timeout > 0) {
-      timeoutHandle = setTimeout(() => {
-        timedOut = true
-        terminal.kill().catch(() => undefined)
-      }, opts.options.timeout * 1000)
-    }
-    opts.options.signal?.addEventListener('abort', abort, { once: true })
-
-    const exit = await terminal.waitForExit()
-    finished = true
-    await emitOutputDelta()
-
-    if (opts.options.signal?.aborted) throw new Error('aborted')
-    if (timedOut) throw new Error(`timeout:${opts.options.timeout}`)
-
-    return { exitCode: typeof exit.exitCode === 'number' ? exit.exitCode : null }
-  } finally {
-    finished = true
-    clearInterval(interval)
-    if (timeoutHandle) clearTimeout(timeoutHandle)
-    opts.options.signal?.removeEventListener('abort', abort)
-    await terminal.release().catch(() => undefined)
-  }
-}
-
-function installAcpTool(session: AgentSessionLike, acpTool: AgentToolLike): void {
-  const tools = session.agent?.state?.tools
-  if (!Array.isArray(tools) || !acpTool.name) return
-
-  let replaced = false
-  session.agent!.state!.tools = tools.map(tool => {
-    if (tool?.name !== acpTool.name) return tool
-    replaced = true
-    return acpTool
-  })
-
-  if (!replaced) session.agent!.state!.tools = [acpTool, ...tools]
 }
 
 function extractAssistantText(message: unknown): string {
