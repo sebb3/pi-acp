@@ -430,6 +430,52 @@ ${stderr}`);
   }
 }
 
+// src/acp/translate/bash.ts
+function isBashTool(toolName) {
+  return toolName.toLowerCase() === "bash";
+}
+function bashCommand(value) {
+  const record = value;
+  const command = record?.command ?? record?.cmd ?? record?.args?.command ?? record?.args?.cmd ?? record?.input?.command ?? record?.input?.cmd ?? record?.rawInput?.command ?? record?.rawInput?.cmd ?? record?.toolInput?.command ?? record?.toolInput?.cmd ?? record?.details?.command ?? record?.details?.cmd;
+  return typeof command === "string" && command.trim() ? command : void 0;
+}
+function bashResultText(result) {
+  const record = result;
+  const content = record?.content;
+  if (Array.isArray(content)) {
+    const texts = content.map((c) => {
+      const block = c;
+      return block.type === "text" && typeof block.text === "string" ? block.text : "";
+    }).filter(Boolean);
+    if (texts.length) return texts.join("");
+  }
+  const details = record?.details;
+  const stdout = (typeof details?.stdout === "string" ? details.stdout : void 0) ?? (typeof record?.stdout === "string" ? record.stdout : void 0) ?? (typeof details?.output === "string" ? details.output : void 0) ?? (typeof record?.output === "string" ? record.output : void 0);
+  const stderr = (typeof details?.stderr === "string" ? details.stderr : void 0) ?? (typeof record?.stderr === "string" ? record.stderr : void 0);
+  return [stdout, stderr].filter((part) => typeof part === "string" && part.length > 0).join("\n");
+}
+function bashExitCode(result, isError) {
+  const record = result;
+  const details = record?.details;
+  const exitCode = details?.exitCode ?? record?.exitCode ?? details?.code ?? record?.code;
+  return typeof exitCode === "number" ? exitCode : isError ? 1 : 0;
+}
+function bashOutputDelta(previous, next) {
+  return next.startsWith(previous) ? next.slice(previous.length) : next;
+}
+function bashTerminalContent(toolCallId) {
+  return [{ type: "terminal", terminalId: toolCallId }];
+}
+function bashTerminalInfoMeta(toolCallId, cwd) {
+  return { terminal_info: { terminal_id: toolCallId, cwd } };
+}
+function bashTerminalOutputMeta(toolCallId, data) {
+  return { terminal_output: { terminal_id: toolCallId, data } };
+}
+function bashTerminalExitMeta(toolCallId, exitCode) {
+  return { terminal_exit: { terminal_id: toolCallId, exit_code: exitCode, signal: null } };
+}
+
 // src/acp/slash-commands.ts
 import { existsSync, readdirSync, readFileSync as readFileSync2 } from "fs";
 import { homedir as homedir2 } from "os";
@@ -695,6 +741,8 @@ var PiAcpSession = class {
   // This is due to pi sending diff as a string as opposed to ACP expected diff format.
   // Compatible format may need to be implemented in pi in the future.
   editSnapshots = /* @__PURE__ */ new Map();
+  bashToolCallIds = /* @__PURE__ */ new Set();
+  bashOutputSnapshots = /* @__PURE__ */ new Map();
   // Ensure `session/update` notifications are sent in order and can be awaited
   // before completing a `session/prompt` request.
   lastEmit = Promise.resolve();
@@ -788,6 +836,40 @@ var PiAcpSession = class {
   }
   async flushEmits() {
     await this.lastEmit;
+  }
+  emitBashToolCall(params) {
+    this.bashToolCallIds.add(params.toolCallId);
+    this.emit({
+      sessionUpdate: params.sessionUpdate,
+      toolCallId: params.toolCallId,
+      title: bashCommand(params.args) ?? params.toolName,
+      kind: "execute",
+      status: params.status,
+      locations: params.locations,
+      ...params.includeTerminal ? { content: bashTerminalContent(params.toolCallId) } : {},
+      ...params.includeTerminal ? { _meta: bashTerminalInfoMeta(params.toolCallId, this.cwd) } : {}
+    });
+  }
+  emitBashOutputUpdate(params) {
+    const text = bashResultText(params.result);
+    const previous = this.bashOutputSnapshots.get(params.toolCallId) ?? "";
+    const delta = bashOutputDelta(previous, text);
+    this.bashOutputSnapshots.set(params.toolCallId, text);
+    this.emit({
+      sessionUpdate: "tool_call_update",
+      toolCallId: params.toolCallId,
+      status: params.status,
+      _meta: {
+        ...delta ? bashTerminalOutputMeta(params.toolCallId, delta) : {},
+        ...params.status === "completed" || params.status === "failed" ? bashTerminalExitMeta(params.toolCallId, bashExitCode(params.result, Boolean(params.isError))) : {}
+      }
+    });
+  }
+  cleanupToolCall(toolCallId) {
+    this.currentToolCalls.delete(toolCallId);
+    this.editSnapshots.delete(toolCallId);
+    this.bashToolCallIds.delete(toolCallId);
+    this.bashOutputSnapshots.delete(toolCallId);
   }
   startTurn(t) {
     this.cancelRequested = false;
@@ -890,7 +972,18 @@ var PiAcpSession = class {
             const locations = toToolCallLocations(rawInput, this.cwd);
             const existingStatus = this.currentToolCalls.get(toolCallId);
             const status = existingStatus ?? "pending";
-            if (!existingStatus) {
+            if (isBashTool(toolName)) {
+              if (!existingStatus) this.currentToolCalls.set(toolCallId, "pending");
+              this.emitBashToolCall({
+                sessionUpdate: existingStatus ? "tool_call_update" : "tool_call",
+                toolCallId,
+                toolName,
+                args: rawInput,
+                status,
+                locations,
+                includeTerminal: !existingStatus
+              });
+            } else if (!existingStatus) {
               this.currentToolCalls.set(toolCallId, "pending");
               this.emit({
                 sessionUpdate: "tool_call",
@@ -920,6 +1013,21 @@ var PiAcpSession = class {
         const toolName = String(ev.toolName ?? "tool");
         const args = ev.args;
         let line;
+        if (isBashTool(toolName)) {
+          const locations2 = toToolCallLocations(args, this.cwd);
+          const existingStatus = this.currentToolCalls.get(toolCallId);
+          this.currentToolCalls.set(toolCallId, "in_progress");
+          this.emitBashToolCall({
+            sessionUpdate: existingStatus ? "tool_call_update" : "tool_call",
+            toolCallId,
+            toolName,
+            args,
+            status: "in_progress",
+            locations: locations2,
+            includeTerminal: !existingStatus
+          });
+          break;
+        }
         if (toolName === "edit") {
           const p = typeof args?.path === "string" ? args.path : void 0;
           if (p) {
@@ -961,6 +1069,10 @@ var PiAcpSession = class {
         const toolCallId = String(ev.toolCallId ?? "");
         if (!toolCallId) break;
         const partial = ev.partialResult;
+        if (this.bashToolCallIds.has(toolCallId)) {
+          this.emitBashOutputUpdate({ toolCallId, status: "in_progress", result: partial });
+          break;
+        }
         const text = toolResultToText(partial);
         this.emit({
           sessionUpdate: "tool_call_update",
@@ -976,6 +1088,16 @@ var PiAcpSession = class {
         if (!toolCallId) break;
         const result = ev.result;
         const isError = Boolean(ev.isError);
+        if (this.bashToolCallIds.has(toolCallId)) {
+          this.emitBashOutputUpdate({
+            toolCallId,
+            status: isError ? "failed" : "completed",
+            result,
+            isError
+          });
+          this.cleanupToolCall(toolCallId);
+          break;
+        }
         const text = toolResultToText(result);
         const snapshot = this.editSnapshots.get(toolCallId);
         let content;
@@ -1007,8 +1129,7 @@ var PiAcpSession = class {
           content,
           rawOutput: result
         });
-        this.currentToolCalls.delete(toolCallId);
-        this.editSnapshots.delete(toolCallId);
+        this.cleanupToolCall(toolCallId);
         break;
       }
       case "auto_retry_start": {
@@ -1161,7 +1282,7 @@ function toToolKind(toolName) {
     case "edit":
       return "edit";
     case "bash":
-      return "other";
+      return "execute";
     default:
       return "other";
   }
@@ -2283,6 +2404,34 @@ ${JSON.stringify(stats, null, 2)}`;
         const toolName = String(m?.toolName ?? "tool");
         const toolCallId = String(m?.toolCallId ?? crypto.randomUUID());
         const isError = Boolean(m?.isError);
+        if (isBashTool(toolName)) {
+          const text2 = bashResultText(m);
+          await this.conn.sessionUpdate({
+            sessionId: session.sessionId,
+            update: {
+              sessionUpdate: "tool_call",
+              toolCallId,
+              title: bashCommand(m) ?? toolName,
+              kind: "execute",
+              status: "completed",
+              content: bashTerminalContent(toolCallId),
+              _meta: bashTerminalInfoMeta(toolCallId, params.cwd)
+            }
+          });
+          await this.conn.sessionUpdate({
+            sessionId: session.sessionId,
+            update: {
+              sessionUpdate: "tool_call_update",
+              toolCallId,
+              status: isError ? "failed" : "completed",
+              _meta: {
+                ...text2 ? bashTerminalOutputMeta(toolCallId, text2) : {},
+                ...bashTerminalExitMeta(toolCallId, bashExitCode(m, isError))
+              }
+            }
+          });
+          continue;
+        }
         await this.conn.sessionUpdate({
           sessionId: session.sessionId,
           update: {
