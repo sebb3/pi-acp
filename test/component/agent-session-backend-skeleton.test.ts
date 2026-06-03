@@ -19,6 +19,7 @@ class FakeAgentSession {
   readonly followUpMode = 'all'
   readonly autoCompactionEnabled = true
   readonly messages: any[] = []
+  readonly agent = { state: { tools: [{ name: 'read', source: 'builtin' }, { name: 'bash' }] as any[] } }
   readonly prompts: Array<{ text: string; options: unknown }> = []
   abortCount = 0
   modelSelections: unknown[] = []
@@ -136,6 +137,56 @@ test('AgentSessionProcess: maps model selection through the in-process session m
   await proc.setModel('test', 'model')
 
   assert.deepEqual(fakeSession.modelSelections, [fakeSession.model])
+})
+
+test('AgentSessionProcess: replaces read with an ACP-backed read tool when the client supports it', async () => {
+  const fakeSession = new FakeAgentSession()
+  const readRequests: any[] = []
+  const conn = {
+    async readTextFile(params: any) {
+      readRequests.push(params)
+      return { content: 'from zed fs' }
+    }
+  }
+  let readOperations: any = null
+
+  await AgentSessionProcess.spawn(
+    {
+      cwd: process.cwd(),
+      conn: conn as any,
+      clientCapabilities: { fs: { readTextFile: true } }
+    },
+    {
+      createAgentSession: async () => ({ session: fakeSession }),
+      createReadTool: (_cwd, options) => {
+        readOperations = options?.operations
+        return { name: 'read', source: 'acp' } as any
+      }
+    }
+  )
+
+  assert.equal(fakeSession.agent.state.tools[0]!.source, 'acp')
+  assert.equal(fakeSession.agent.state.tools[1]!.name, 'bash')
+  assert.equal((await readOperations.readFile('/tmp/file.txt')).toString('utf8'), 'from zed fs')
+  assert.deepEqual(readRequests, [{ sessionId: 'agent-session-1', path: '/tmp/file.txt' }])
+})
+
+test('AgentSessionProcess: keeps native read when the client does not advertise fs read support', async () => {
+  const fakeSession = new FakeAgentSession()
+
+  await AgentSessionProcess.spawn(
+    {
+      cwd: process.cwd(),
+      conn: {} as any,
+      clientCapabilities: { fs: { readTextFile: false } }
+    },
+    {
+      createAgentSession: async () => ({ session: fakeSession }),
+      createReadTool: () => ({ name: 'read', source: 'acp' }) as any
+    }
+  )
+
+  assert.equal(fakeSession.agent.state.tools[0]!.source, 'builtin')
 })
 
 test('PiAcpAgent: in-process AgentSession backend maps cancellation to cancelled stop reason', async () => {

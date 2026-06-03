@@ -354,11 +354,19 @@ var AgentSessionProcess = class _AgentSessionProcess {
   static async spawn(params, deps = {}) {
     const sdk = deps.createAgentSession ? null : await loadPiSdkModule();
     const createAgentSession = deps.createAgentSession ?? sdk.createAgentSession;
+    const createReadTool = deps.createReadTool ?? sdk?.createReadTool;
     const sessionManager = params.sessionPath ? sdk?.SessionManager?.open(params.sessionPath, void 0, params.cwd) : void 0;
     const result = await createAgentSession({
       cwd: params.cwd,
       ...sessionManager ? { sessionManager } : {}
     });
+    if (createReadTool && shouldUseAcpRead(params)) {
+      installAcpReadTool(result.session, {
+        cwd: params.cwd,
+        conn: params.conn,
+        createReadTool
+      });
+    }
     return new _AgentSessionProcess(result.session);
   }
   onEvent(handler) {
@@ -487,6 +495,31 @@ async function loadPiSdkModule() {
     throw new Error(`${PI_PACKAGE} does not export createAgentSession`);
   }
   return mod;
+}
+function shouldUseAcpRead(params) {
+  return Boolean(params.conn && params.clientCapabilities?.fs?.readTextFile);
+}
+function installAcpReadTool(session, opts) {
+  const tools = session.agent?.state?.tools;
+  if (!Array.isArray(tools)) return;
+  const acpReadTool = opts.createReadTool(opts.cwd, {
+    operations: {
+      access: async (_absolutePath) => {
+      },
+      readFile: async (absolutePath) => {
+        const sessionId = session.sessionId ?? "";
+        const result = await opts.conn.readTextFile({ sessionId, path: absolutePath });
+        return Buffer.from(result.content, "utf8");
+      }
+    }
+  });
+  let replaced = false;
+  session.agent.state.tools = tools.map((tool) => {
+    if (tool?.name !== "read") return tool;
+    replaced = true;
+    return acpReadTool;
+  });
+  if (!replaced) session.agent.state.tools = [acpReadTool, ...tools];
 }
 function extractAssistantText(message) {
   const role = message?.role;
@@ -764,7 +797,12 @@ function expandSlashCommand(text, fileCommands) {
 // src/acp/session.ts
 async function defaultSpawnProcess(params) {
   if (process.env.PI_ACP_BACKEND === "agent-session") {
-    return AgentSessionProcess.spawn({ cwd: params.cwd, sessionPath: params.sessionPath });
+    return AgentSessionProcess.spawn({
+      cwd: params.cwd,
+      sessionPath: params.sessionPath,
+      conn: params.conn,
+      clientCapabilities: params.clientCapabilities
+    });
   }
   return PiRpcProcess.spawn({
     cwd: params.cwd,
@@ -794,8 +832,12 @@ var SessionManager = class {
   sessions = /* @__PURE__ */ new Map();
   store = new SessionStore();
   spawnProcess;
+  clientCapabilities;
   constructor(options = {}) {
     this.spawnProcess = options.spawnProcess ?? defaultSpawnProcess;
+  }
+  setClientCapabilities(capabilities) {
+    this.clientCapabilities = capabilities;
   }
   /** Dispose all sessions and their underlying pi subprocesses. */
   disposeAll() {
@@ -830,7 +872,9 @@ var SessionManager = class {
     try {
       proc = await this.spawnProcess({
         cwd: params.cwd,
-        piCommand: params.piCommand
+        piCommand: params.piCommand,
+        conn: params.conn,
+        clientCapabilities: this.clientCapabilities
       });
     } catch (e) {
       if (e instanceof PiRpcSpawnError) {
@@ -879,7 +923,9 @@ var SessionManager = class {
     const proc = await this.spawnProcess({
       cwd: params.cwd,
       piCommand: params.piCommand,
-      sessionPath: params.sessionFile
+      sessionPath: params.sessionFile,
+      conn: params.conn,
+      clientCapabilities: this.clientCapabilities
     });
     return this.registerExisting(sessionId, { ...params, proc });
   }
@@ -2001,6 +2047,7 @@ var PiAcpAgent = class {
     return session;
   }
   async initialize(params) {
+    this.sessions.setClientCapabilities(params.clientCapabilities);
     const supportedVersion = 1;
     const requested = params.protocolVersion;
     return {

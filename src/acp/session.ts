@@ -1,5 +1,6 @@
 import type {
   AgentSideConnection,
+  ClientCapabilities,
   ContentBlock,
   McpServer,
   SessionUpdate,
@@ -41,6 +42,8 @@ type ProcessSpawnParams = {
   cwd: string
   piCommand?: string
   sessionPath?: string
+  conn?: AgentSideConnection
+  clientCapabilities?: ClientCapabilities
 }
 
 type SessionManagerOptions = {
@@ -49,7 +52,12 @@ type SessionManagerOptions = {
 
 async function defaultSpawnProcess(params: ProcessSpawnParams): Promise<PiProcessLike> {
   if (process.env.PI_ACP_BACKEND === 'agent-session') {
-    return AgentSessionProcess.spawn({ cwd: params.cwd, sessionPath: params.sessionPath })
+    return AgentSessionProcess.spawn({
+      cwd: params.cwd,
+      sessionPath: params.sessionPath,
+      conn: params.conn,
+      clientCapabilities: params.clientCapabilities
+    })
   }
 
   return PiRpcProcess.spawn({
@@ -105,9 +113,14 @@ export class SessionManager {
   private sessions = new Map<string, PiAcpSession>()
   private readonly store = new SessionStore()
   private readonly spawnProcess: (params: ProcessSpawnParams) => Promise<PiProcessLike>
+  private clientCapabilities: ClientCapabilities | undefined
 
   constructor(options: SessionManagerOptions = {}) {
     this.spawnProcess = options.spawnProcess ?? defaultSpawnProcess
+  }
+
+  setClientCapabilities(capabilities: ClientCapabilities | undefined): void {
+    this.clientCapabilities = capabilities
   }
 
   /** Dispose all sessions and their underlying pi subprocesses. */
@@ -150,7 +163,9 @@ export class SessionManager {
     try {
       proc = await this.spawnProcess({
         cwd: params.cwd,
-        piCommand: params.piCommand
+        piCommand: params.piCommand,
+        conn: params.conn,
+        clientCapabilities: this.clientCapabilities
       })
     } catch (e) {
       if (e instanceof PiRpcSpawnError) {
@@ -211,7 +226,9 @@ export class SessionManager {
     const proc = await this.spawnProcess({
       cwd: params.cwd,
       piCommand: params.piCommand,
-      sessionPath: params.sessionFile
+      sessionPath: params.sessionFile,
+      conn: params.conn,
+      clientCapabilities: this.clientCapabilities
     })
 
     return this.registerExisting(sessionId, { ...params, proc })
