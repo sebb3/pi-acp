@@ -7,6 +7,37 @@ import { pathToFileURL } from 'node:url'
 import { PiAcpSession } from '../../src/acp/session.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
 
+test('PiAcpSession: sends startup info at most once across pre-prompt and first prompt paths', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  session.setStartupInfo('startup\n')
+  session.sendStartupInfoIfPending()
+  const prompt = session.prompt('hello')
+
+  await new Promise(r => setTimeout(r, 0))
+  proc.emit({ type: 'agent_end' })
+  await prompt
+  await new Promise(r => setTimeout(r, 0))
+
+  const startupChunks = conn.updates.filter(
+    msg =>
+      msg.update.sessionUpdate === 'agent_message_chunk' &&
+      (msg.update as any).content?.type === 'text' &&
+      (msg.update as any).content?.text === 'startup\n'
+  )
+  assert.equal(startupChunks.length, 1)
+})
+
 test('PiAcpSession: emits agent_message_chunk for text_delta', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
@@ -814,7 +845,7 @@ test('PiAcpSession: agent_end still resolves when session stats are unavailable'
   )
 })
 
-test('PiAcpSession: re-emits startup info as the first chunk of the first prompt', async () => {
+test('PiAcpSession: does not re-emit startup info on the first prompt after pre-prompt send', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
 
@@ -838,16 +869,13 @@ test('PiAcpSession: re-emits startup info as the first chunk of the first prompt
 
   assert.equal(proc.prompts.length, 1)
   assert.equal(proc.prompts[0]!.message, 'hello')
-  assert.equal(conn.updates[0]!.update.sessionUpdate, 'agent_message_chunk')
-  assert.deepEqual(conn.updates[0]!.update, {
-    sessionUpdate: 'agent_message_chunk',
-    content: { type: 'text', text: notice }
-  })
-  assert.equal(conn.updates[1]!.update.sessionUpdate, 'agent_message_chunk')
-  assert.deepEqual(conn.updates[1]!.update, {
-    sessionUpdate: 'agent_message_chunk',
-    content: { type: 'text', text: notice }
-  })
+  const startupChunks = conn.updates.filter(
+    msg =>
+      msg.update.sessionUpdate === 'agent_message_chunk' &&
+      (msg.update as any).content?.type === 'text' &&
+      (msg.update as any).content?.text === notice
+  )
+  assert.equal(startupChunks.length, 1)
 
   proc.emit({ type: 'agent_start' })
   proc.emit({ type: 'turn_end' })

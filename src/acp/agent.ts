@@ -41,13 +41,13 @@ import {
 } from './translate/bash.js'
 import { promptToPiMessage } from './translate/prompt.js'
 import { loadSlashCommands, parseCommandArgs, toAvailableCommands } from './slash-commands.js'
-import { getAgentDir, getEnableSkillCommands, getQuietStartup } from './pi-settings.js'
+import { getEnableSkillCommands, getQuietStartup } from './pi-settings.js'
 import { toAvailableCommandsFromPiGetCommands } from './pi-commands.js'
 import { maybeAuthRequiredError } from './auth-required.js'
 import { isAbsolute } from 'node:path'
-import { existsSync, readFileSync, realpathSync, readdirSync, statSync, unlinkSync } from 'node:fs'
+import { existsSync, readFileSync, realpathSync, unlinkSync } from 'node:fs'
 import type { AvailableCommand } from '@agentclientprotocol/sdk'
-import { join, dirname, basename } from 'node:path'
+import { join, dirname } from 'node:path'
 import { spawnSync } from 'node:child_process'
 
 type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
@@ -1582,127 +1582,12 @@ function buildStartupInfo(opts: {
     // ignore
   }
 
-  const addSection = (title: string, items: string[]) => {
-    const cleaned = items.map(s => s.trim()).filter(Boolean)
-    if (!cleaned.length) return
-
-    md.push(`## ${title}`)
-    for (const item of cleaned) md.push(`- ${item}`)
+  const contextPath = join(opts.cwd, 'AGENTS.md')
+  if (existsSync(contextPath)) {
+    md.push('## Context')
+    md.push(`- ${contextPath}`)
     md.push('')
   }
-
-  // Context
-  const contextItems: string[] = []
-  const contextPath = join(opts.cwd, 'AGENTS.md')
-  if (existsSync(contextPath)) contextItems.push(contextPath)
-  addSection('Context', contextItems)
-
-  // Skills
-  const skillsItems: string[] = []
-
-  const pushSkillFromRoot = (root: string) => {
-    try {
-      // Direct .md files in root
-      for (const e of readdirSync(root)) {
-        const p = join(root, e)
-        try {
-          const st = statSync(p)
-          if (st.isFile() && e.toLowerCase().endsWith('.md')) {
-            skillsItems.push(p)
-          }
-        } catch {
-          // ignore
-        }
-      }
-
-      // Recursive SKILL.md under subdirectories
-      const stack: string[] = [root]
-      while (stack.length) {
-        const dir = stack.pop()!
-        let entries: string[] = []
-        try {
-          entries = readdirSync(dir)
-        } catch {
-          continue
-        }
-
-        for (const name of entries) {
-          // Skip obvious noise
-          if (name === 'node_modules' || name === '.git') continue
-          const p = join(dir, name)
-          let st
-          try {
-            st = statSync(p)
-          } catch {
-            continue
-          }
-          if (st.isDirectory()) {
-            stack.push(p)
-          } else if (st.isFile() && name === 'SKILL.md') {
-            skillsItems.push(p)
-          }
-        }
-      }
-    } catch {
-      // ignore
-    }
-  }
-
-  // Global skills
-  // Use getAgentDir() so this respects PI_CODING_AGENT_DIR overrides.
-  const globalSkillsDir = join(getAgentDir(), 'skills')
-  pushSkillFromRoot(globalSkillsDir)
-
-  // Also support ~/.agents/skills (pi skill discovery)
-  const legacyAgentsSkillsDir = join(process.env.HOME ?? '', '.agents', 'skills')
-  pushSkillFromRoot(legacyAgentsSkillsDir)
-
-  // Project skills (.pi/skills)
-  const projectSkillsDir = join(opts.cwd, '.pi', 'skills')
-  pushSkillFromRoot(projectSkillsDir)
-
-  addSection('Skills', skillsItems)
-
-  // Prompts
-  const promptsItems: string[] = []
-  const promptsDir = join(process.env.HOME ?? '', '.pi', 'agent', 'prompts')
-  try {
-    const prompts = readdirSync(promptsDir).filter(f => f.endsWith('.md'))
-    for (const f of prompts) promptsItems.push(`/${basename(f, '.md')}`)
-  } catch {
-    // ignore
-  }
-  addSection('Prompts', promptsItems)
-
-  // Extensions
-  const extItems: string[] = []
-  const extDir = join(process.env.HOME ?? '', '.pi', 'agent', 'extensions')
-  try {
-    const exts = readdirSync(extDir).filter(f => f.endsWith('.ts') || f.endsWith('.js'))
-    for (const f of exts) extItems.push(join(extDir, f))
-  } catch {
-    // ignore
-  }
-
-  // Also show npm packages from pi settings (best-effort)
-  try {
-    const settingsPath = join(process.env.HOME ?? '', '.pi', 'agent', 'settings.json')
-    const settings = JSON.parse(readFileSync(settingsPath, 'utf-8')) as any
-    const pkgs: string[] = Array.isArray(settings?.packages) ? settings.packages : []
-    for (const pkg of pkgs) {
-      const s = String(pkg)
-      if (s.startsWith('npm:')) {
-        // Render a two-line bullet structure using markdown indentation.
-        extItems.push(`${s}\n  - index.ts`)
-      } else {
-        extItems.push(s)
-      }
-    }
-  } catch {
-    // ignore
-  }
-
-  addSection('Extensions', extItems)
 
   if (opts.updateNotice) {
     md.push('---')
@@ -1710,7 +1595,6 @@ function buildStartupInfo(opts: {
     md.push('')
   }
 
-  // Do NOT include themes (per request).
   return md.join('\n').trim() + '\n'
 }
 
