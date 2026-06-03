@@ -11,7 +11,9 @@ import { RequestError } from '@agentclientprotocol/sdk'
 import { maybeAuthRequiredError } from './auth-required.js'
 import { readFileSync } from 'node:fs'
 import { isAbsolute, resolve as resolvePath } from 'node:path'
-import { PiRpcProcess, PiRpcSpawnError, type PiRpcEvent } from '../pi-rpc/process.js'
+import { PiRpcProcess, PiRpcSpawnError } from '../pi-rpc/process.js'
+import { AgentSessionProcess } from '../pi-agent-session/process.js'
+import type { PiProcessEvent as PiRpcEvent, PiProcessLike } from '../pi-process/types.js'
 import { SessionStore } from './session-store.js'
 import { toolResultToText } from './translate/pi-tools.js'
 import {
@@ -33,6 +35,26 @@ type SessionCreateParams = {
   conn: AgentSideConnection
   fileCommands?: import('./slash-commands.js').FileSlashCommand[]
   piCommand?: string
+}
+
+type ProcessSpawnParams = {
+  cwd: string
+  piCommand?: string
+}
+
+type SessionManagerOptions = {
+  spawnProcess?: (params: ProcessSpawnParams) => Promise<PiProcessLike>
+}
+
+async function defaultSpawnProcess(params: ProcessSpawnParams): Promise<PiProcessLike> {
+  if (process.env.PI_ACP_BACKEND === 'agent-session') {
+    return AgentSessionProcess.spawn({ cwd: params.cwd })
+  }
+
+  return PiRpcProcess.spawn({
+    cwd: params.cwd,
+    piCommand: params.piCommand
+  })
 }
 
 export type StopReason = 'end_turn' | 'cancelled' | 'error'
@@ -80,6 +102,11 @@ function toToolCallLocations(args: unknown, cwd: string, line?: number): ToolCal
 export class SessionManager {
   private sessions = new Map<string, PiAcpSession>()
   private readonly store = new SessionStore()
+  private readonly spawnProcess: (params: ProcessSpawnParams) => Promise<PiProcessLike>
+
+  constructor(options: SessionManagerOptions = {}) {
+    this.spawnProcess = options.spawnProcess ?? defaultSpawnProcess
+  }
 
   /** Dispose all sessions and their underlying pi subprocesses. */
   disposeAll(): void {
@@ -117,9 +144,9 @@ export class SessionManager {
   async create(params: SessionCreateParams): Promise<PiAcpSession> {
     // Let pi manage session persistence in its default location (~/.pi/agent/sessions/...)
     // so sessions are visible to the regular `pi` CLI.
-    let proc: PiRpcProcess
+    let proc: PiProcessLike
     try {
-      proc = await PiRpcProcess.spawn({
+      proc = await this.spawnProcess({
         cwd: params.cwd,
         piCommand: params.piCommand
       })
@@ -168,7 +195,7 @@ export class SessionManager {
    * Used by session/load: create a session object bound to an existing sessionId/proc
    * if it isn't already registered.
    */
-  getOrCreate(sessionId: string, params: SessionCreateParams & { proc: PiRpcProcess }): PiAcpSession {
+  getOrCreate(sessionId: string, params: SessionCreateParams & { proc: PiProcessLike }): PiAcpSession {
     const existing = this.sessions.get(sessionId)
     if (existing) return existing
 
@@ -196,7 +223,7 @@ export class PiAcpSession {
   private startupInfoSentOutOfTurn = false
   private startupInfoSentInPrompt = false
 
-  readonly proc: PiRpcProcess
+  readonly proc: PiProcessLike
   private readonly conn: AgentSideConnection
   private readonly fileCommands: FileSlashCommand[]
   private readonly piCommand?: string
@@ -234,7 +261,7 @@ export class PiAcpSession {
     sessionId: string
     cwd: string
     mcpServers: McpServer[]
-    proc: PiRpcProcess
+    proc: PiProcessLike
     conn: AgentSideConnection
     fileCommands?: FileSlashCommand[]
     piCommand?: string
@@ -465,6 +492,11 @@ export class PiAcpSession {
   }
 
   private maybeAutoNameAfterFirstTurn(): void {
+    // The in-process skeleton deliberately avoids spawning a temporary Pi RPC process.
+    // Auto-title parity is handled by a later slice once the AgentSession backend can
+    // generate titles in-process too.
+    if (this.proc.backendKind === 'agent-session') return
+
     void this.autoNameAfterFirstTurn().catch(() => {
       // Naming is best-effort; never affect the active prompt flow.
     })

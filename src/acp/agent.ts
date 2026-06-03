@@ -21,6 +21,7 @@ import {
 } from '@agentclientprotocol/sdk'
 import { getAuthMethods } from './auth.js'
 import { SessionManager, type PiAcpSession } from './session.js'
+import type { PiProcessLike } from '../pi-process/types.js'
 import { SessionStore } from './session-store.js'
 import { PiRpcProcess } from '../pi-rpc/process.js'
 import { listPiSessions, findPiSessionFile } from './pi-sessions.js'
@@ -108,9 +109,13 @@ import { fileURLToPath } from 'node:url'
 
 const pkg = readNearestPackageJson(import.meta.url)
 
+type PiAcpAgentConfig = {
+  sessionManager?: SessionManager
+}
+
 export class PiAcpAgent implements ACPAgent {
   private readonly conn: AgentSideConnection
-  private readonly sessions = new SessionManager()
+  private readonly sessions: SessionManager
   private readonly store = new SessionStore()
 
   dispose(): void {
@@ -120,9 +125,9 @@ export class PiAcpAgent implements ACPAgent {
   // Remember recent session cwd and use it as the default filter.
   private lastSessionCwd: string | null = null
 
-  constructor(conn: AgentSideConnection, _config?: unknown) {
+  constructor(conn: AgentSideConnection, config: PiAcpAgentConfig = {}) {
     this.conn = conn
-    void _config
+    this.sessions = config.sessionManager ?? new SessionManager()
   }
 
   private cleanupFailedNewSession(sessionId: string, state?: any | null): void {
@@ -156,7 +161,7 @@ export class PiAcpAgent implements ACPAgent {
     }
   }
 
-  private async spawnPiSession(cwd: string, sessionFile: string): Promise<PiRpcProcess> {
+  private async spawnPiSession(cwd: string, sessionFile: string): Promise<PiProcessLike> {
     try {
       return await PiRpcProcess.spawn({
         cwd,
@@ -757,7 +762,7 @@ export class PiAcpAgent implements ACPAgent {
 
         let resultPath = ''
         try {
-          const result = await session.proc.exportHtml(outputPath)
+          const result = (await session.proc.exportHtml(outputPath)) as any
           resultPath = result.path
         } catch (e: any) {
           await this.conn.sessionUpdate({
@@ -1114,7 +1119,7 @@ function isThinkingLevel(x: string): x is ThinkingLevel {
 }
 
 async function getThinkingState(
-  proc: PiRpcProcess,
+  proc: PiProcessLike,
   pre?: { state?: any | null }
 ): Promise<{
   availableModes: Array<{
@@ -1153,7 +1158,7 @@ async function getThinkingState(
 }
 
 async function getModelState(
-  proc: PiRpcProcess,
+  proc: PiProcessLike,
   pre?: { state?: any | null; availableModels?: any | null }
 ): Promise<{
   availableModels: ModelInfo[]

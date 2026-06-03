@@ -120,6 +120,7 @@ function stripAnsi(s) {
   return s.replace(ANSI_ESCAPE_REGEX, "");
 }
 var PiRpcProcess = class _PiRpcProcess {
+  backendKind = "rpc";
   child;
   pending = /* @__PURE__ */ new Map();
   eventHandlers = [];
@@ -337,6 +338,160 @@ var PiRpcProcess = class _PiRpcProcess {
     });
   }
 };
+
+// src/pi-agent-session/process.ts
+var PI_PACKAGE = "@earendil-works/pi-coding-agent";
+var AgentSessionProcess = class _AgentSessionProcess {
+  constructor(session) {
+    this.session = session;
+    this.unsubscribe = session.subscribe((ev) => {
+      for (const h of this.handlers) h(ev);
+    });
+  }
+  backendKind = "agent-session";
+  handlers = [];
+  unsubscribe;
+  static async spawn(params, deps = {}) {
+    const createAgentSession = deps.createAgentSession ?? await loadCreateAgentSession();
+    const result = await createAgentSession({
+      cwd: params.cwd,
+      ...params.sessionPath ? { sessionFile: params.sessionPath } : {}
+    });
+    return new _AgentSessionProcess(result.session);
+  }
+  onEvent(handler) {
+    this.handlers.push(handler);
+    return () => {
+      this.handlers = this.handlers.filter((h) => h !== handler);
+    };
+  }
+  dispose() {
+    this.unsubscribe?.();
+    this.unsubscribe = void 0;
+    this.session.dispose();
+  }
+  consumePreludeLines() {
+    return [];
+  }
+  async prompt(message, images = []) {
+    await this.session.prompt(message, { images, source: "acp" });
+  }
+  async abort() {
+    await this.session.abort();
+  }
+  async getState() {
+    const model = this.session.model;
+    return {
+      sessionId: this.session.sessionId,
+      sessionFile: this.session.sessionFile,
+      sessionName: this.session.sessionName,
+      model: model ? {
+        provider: model.provider,
+        modelId: model.modelId ?? model.id,
+        id: model.id ?? model.modelId,
+        name: model.name ?? model.id ?? model.modelId
+      } : null,
+      thinkingLevel: this.session.thinkingLevel,
+      steeringMode: this.session.steeringMode,
+      followUpMode: this.session.followUpMode,
+      autoCompactionEnabled: this.session.autoCompactionEnabled,
+      messageCount: Array.isArray(this.session.messages) ? this.session.messages.length : void 0
+    };
+  }
+  async getAvailableModels() {
+    const registry = this.session.modelRegistry;
+    if (typeof registry?.getAvailableModels === "function") return registry.getAvailableModels();
+    if (Array.isArray(registry?.models)) return { models: registry.models };
+    const model = this.session.model;
+    if (!model) return { models: [] };
+    return {
+      models: [
+        {
+          provider: model.provider,
+          id: model.id ?? model.modelId,
+          modelId: model.modelId ?? model.id,
+          name: model.name ?? model.id ?? model.modelId
+        }
+      ]
+    };
+  }
+  async setModel(_provider, _modelId) {
+    throw new Error("AgentSessionProcess.setModel is not implemented in the skeleton backend");
+  }
+  async setThinkingLevel(level) {
+    this.session.setThinkingLevel?.(level);
+  }
+  async setFollowUpMode(mode) {
+    this.session.setFollowUpMode?.(mode);
+  }
+  async setSteeringMode(mode) {
+    this.session.setSteeringMode?.(mode);
+  }
+  async compact(customInstructions) {
+    if (!this.session.compact) throw new Error("AgentSessionProcess.compact is not implemented");
+    return this.session.compact(customInstructions);
+  }
+  async setAutoCompaction(enabled) {
+    this.session.setAutoCompactionEnabled?.(enabled);
+  }
+  async getSessionStats() {
+    return {
+      sessionId: this.session.sessionId,
+      sessionFile: this.session.sessionFile,
+      totalMessages: Array.isArray(this.session.messages) ? this.session.messages.length : 0
+    };
+  }
+  async setSessionName(_name) {
+    throw new Error("AgentSessionProcess.setSessionName is not implemented in the skeleton backend");
+  }
+  async exportHtml(_outputPath) {
+    throw new Error("AgentSessionProcess.exportHtml is not implemented in the skeleton backend");
+  }
+  async switchSession(_sessionPath) {
+    throw new Error("AgentSessionProcess.switchSession is not implemented in the skeleton backend");
+  }
+  async getMessages() {
+    return { messages: this.session.messages ?? [] };
+  }
+  async getLastAssistantText() {
+    const messages = this.session.messages ?? [];
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const text = extractAssistantText(messages[i]);
+      if (text) return text;
+    }
+    return "";
+  }
+  async getCommands() {
+    return { commands: [] };
+  }
+};
+async function loadCreateAgentSession() {
+  let mod;
+  try {
+    mod = await import(PI_PACKAGE);
+  } catch (e) {
+    if (e?.code === "ERR_MODULE_NOT_FOUND") {
+      throw new Error(
+        `PI_ACP_BACKEND=agent-session requires ${PI_PACKAGE} to be available to pi-acp. Install pi or package it with the ACP adapter before using this backend.`
+      );
+    }
+    throw e;
+  }
+  if (typeof mod.createAgentSession !== "function") {
+    throw new Error(`${PI_PACKAGE} does not export createAgentSession`);
+  }
+  return mod.createAgentSession;
+}
+function extractAssistantText(message) {
+  const role = message?.role;
+  if (role && role !== "assistant") return "";
+  const content = message?.content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map((part) => typeof part?.text === "string" ? part.text : "").filter(Boolean).join("\n");
+  }
+  return "";
+}
 
 // src/acp/session-store.ts
 import { mkdirSync, readFileSync, writeFileSync } from "fs";
@@ -601,6 +756,15 @@ function expandSlashCommand(text, fileCommands) {
 }
 
 // src/acp/session.ts
+async function defaultSpawnProcess(params) {
+  if (process.env.PI_ACP_BACKEND === "agent-session") {
+    return AgentSessionProcess.spawn({ cwd: params.cwd });
+  }
+  return PiRpcProcess.spawn({
+    cwd: params.cwd,
+    piCommand: params.piCommand
+  });
+}
 function findUniqueLineNumber(text, needle) {
   if (!needle) return void 0;
   const first = text.indexOf(needle);
@@ -622,6 +786,10 @@ function toToolCallLocations(args, cwd, line) {
 var SessionManager = class {
   sessions = /* @__PURE__ */ new Map();
   store = new SessionStore();
+  spawnProcess;
+  constructor(options = {}) {
+    this.spawnProcess = options.spawnProcess ?? defaultSpawnProcess;
+  }
   /** Dispose all sessions and their underlying pi subprocesses. */
   disposeAll() {
     for (const [id] of this.sessions) this.close(id);
@@ -653,7 +821,7 @@ var SessionManager = class {
   async create(params) {
     let proc;
     try {
-      proc = await PiRpcProcess.spawn({
+      proc = await this.spawnProcess({
         cwd: params.cwd,
         piCommand: params.piCommand
       });
@@ -900,6 +1068,7 @@ var PiAcpSession = class {
     });
   }
   maybeAutoNameAfterFirstTurn() {
+    if (this.proc.backendKind === "agent-session") return;
     void this.autoNameAfterFirstTurn().catch(() => {
     });
   }
@@ -1749,16 +1918,16 @@ function mergeCommands(a, b) {
 var pkg = readNearestPackageJson(import.meta.url);
 var PiAcpAgent = class {
   conn;
-  sessions = new SessionManager();
+  sessions;
   store = new SessionStore();
   dispose() {
     this.sessions.disposeAll();
   }
   // Remember recent session cwd and use it as the default filter.
   lastSessionCwd = null;
-  constructor(conn, _config) {
+  constructor(conn, config = {}) {
     this.conn = conn;
-    void _config;
+    this.sessions = config.sessionManager ?? new SessionManager();
   }
   cleanupFailedNewSession(sessionId, state) {
     this.sessions.close(sessionId);
