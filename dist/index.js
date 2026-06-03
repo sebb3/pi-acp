@@ -357,6 +357,7 @@ var AgentSessionProcess = class _AgentSessionProcess {
     const createReadToolDefinition = deps.createReadToolDefinition ?? sdk?.createReadToolDefinition;
     const createWriteToolDefinition = deps.createWriteToolDefinition ?? sdk?.createWriteToolDefinition;
     const createEditToolDefinition = deps.createEditToolDefinition ?? sdk?.createEditToolDefinition;
+    const createBashToolDefinition = deps.createBashToolDefinition ?? sdk?.createBashToolDefinition;
     const sessionManager = params.sessionPath ? sdk?.SessionManager?.open(params.sessionPath, void 0, params.cwd) : void 0;
     const sessionIdRef = { current: "" };
     const customTools = [];
@@ -386,6 +387,16 @@ var AgentSessionProcess = class _AgentSessionProcess {
           cwd: params.cwd,
           conn: params.conn,
           createEditToolDefinition,
+          getSessionId: () => sessionIdRef.current
+        })
+      );
+    }
+    if (createBashToolDefinition && shouldUseAcpTerminal(params)) {
+      customTools.push(
+        createAcpBashToolDefinition({
+          cwd: params.cwd,
+          conn: params.conn,
+          createBashToolDefinition,
           getSessionId: () => sessionIdRef.current
         })
       );
@@ -535,6 +546,9 @@ function shouldUseAcpWrite(params) {
 function shouldUseAcpEdit(params) {
   return Boolean(params.conn && params.clientCapabilities?.fs?.readTextFile && params.clientCapabilities?.fs?.writeTextFile);
 }
+function shouldUseAcpTerminal(params) {
+  return Boolean(params.conn && params.clientCapabilities?.terminal);
+}
 function createAcpReadToolDefinition(opts) {
   return opts.createReadToolDefinition(opts.cwd, {
     operations: {
@@ -572,6 +586,67 @@ function createAcpEditToolDefinition(opts) {
       }
     }
   });
+}
+function createAcpBashToolDefinition(opts) {
+  return opts.createBashToolDefinition(opts.cwd, {
+    operations: {
+      exec: async (command, cwd, options) => runAcpTerminalCommand({ ...opts, command, cwd, options })
+    }
+  });
+}
+async function runAcpTerminalCommand(opts) {
+  if (opts.options.signal?.aborted) throw new Error("aborted");
+  const shell = process.env.SHELL || "/bin/bash";
+  const env = Object.entries(opts.options.env ?? {}).filter((entry) => typeof entry[1] === "string").map(([name, value]) => ({ name, value }));
+  const terminal = await opts.conn.createTerminal({
+    sessionId: opts.getSessionId(),
+    command: shell,
+    args: ["-lc", opts.command],
+    cwd: opts.cwd,
+    env,
+    outputByteLimit: 1024 * 1024
+  });
+  let lastOutput = "";
+  let finished = false;
+  let timedOut = false;
+  let timeoutHandle;
+  const emitOutputDelta = async () => {
+    const output2 = await terminal.currentOutput();
+    if (output2.output.startsWith(lastOutput)) {
+      const delta = output2.output.slice(lastOutput.length);
+      if (delta) opts.options.onData(Buffer.from(delta, "utf8"));
+    } else if (output2.output) {
+      opts.options.onData(Buffer.from(output2.output, "utf8"));
+    }
+    lastOutput = output2.output;
+  };
+  const interval = setInterval(() => {
+    if (!finished) emitOutputDelta().catch(() => void 0);
+  }, 100);
+  const abort = () => {
+    terminal.kill().catch(() => void 0);
+  };
+  try {
+    if (opts.options.timeout && opts.options.timeout > 0) {
+      timeoutHandle = setTimeout(() => {
+        timedOut = true;
+        terminal.kill().catch(() => void 0);
+      }, opts.options.timeout * 1e3);
+    }
+    opts.options.signal?.addEventListener("abort", abort, { once: true });
+    const exit = await terminal.waitForExit();
+    finished = true;
+    await emitOutputDelta();
+    if (opts.options.signal?.aborted) throw new Error("aborted");
+    if (timedOut) throw new Error(`timeout:${opts.options.timeout}`);
+    return { exitCode: typeof exit.exitCode === "number" ? exit.exitCode : null };
+  } finally {
+    finished = true;
+    clearInterval(interval);
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+    opts.options.signal?.removeEventListener("abort", abort);
+    await terminal.release().catch(() => void 0);
+  }
 }
 function installAcpTool(session, acpTool) {
   const tools = session.agent?.state?.tools;

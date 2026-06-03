@@ -269,6 +269,76 @@ test('AgentSessionProcess: replaces edit with an ACP-backed edit tool when the c
   ])
 })
 
+test('AgentSessionProcess: replaces bash with an ACP terminal-backed bash tool when the client supports terminals', async () => {
+  const fakeSession = new FakeAgentSession()
+  const terminalRequests: any[] = []
+  const terminalCalls: string[] = []
+  const conn = {
+    async createTerminal(params: any) {
+      terminalRequests.push(params)
+      return {
+        id: 'terminal-1',
+        async currentOutput() {
+          terminalCalls.push('currentOutput')
+          return { output: 'hello\n', truncated: false, exitStatus: { exitCode: 0 } }
+        },
+        async waitForExit() {
+          terminalCalls.push('waitForExit')
+          return { exitCode: 0, signal: null }
+        },
+        async kill() {
+          terminalCalls.push('kill')
+          return {}
+        },
+        async release() {
+          terminalCalls.push('release')
+          return {}
+        }
+      }
+    }
+  }
+  let bashOperations: any = null
+
+  await AgentSessionProcess.spawn(
+    {
+      cwd: process.cwd(),
+      conn: conn as any,
+      clientCapabilities: { terminal: true }
+    },
+    {
+      createAgentSession: async options => {
+        assert.equal((options as any).customTools?.[0]?.source, 'acp')
+        return { session: fakeSession }
+      },
+      createBashToolDefinition: (_cwd, options) => {
+        bashOperations = options?.operations
+        return { name: 'bash', source: 'acp' } as any
+      }
+    }
+  )
+
+  const output: Buffer[] = []
+  const result = await bashOperations.exec('echo hello', process.cwd(), { onData: (data: Buffer) => output.push(data) })
+
+  assert.equal(fakeSession.agent.state.tools[0]!.name, 'read')
+  assert.equal(fakeSession.agent.state.tools[1]!.name, 'write')
+  assert.equal(fakeSession.agent.state.tools[2]!.name, 'edit')
+  assert.equal(fakeSession.agent.state.tools[3]!.source, 'acp')
+  assert.equal(result.exitCode, 0)
+  assert.equal(Buffer.concat(output).toString('utf8'), 'hello\n')
+  assert.deepEqual(terminalRequests, [
+    {
+      sessionId: 'agent-session-1',
+      command: process.env.SHELL || '/bin/bash',
+      args: ['-lc', 'echo hello'],
+      cwd: process.cwd(),
+      env: [],
+      outputByteLimit: 1024 * 1024
+    }
+  ])
+  assert.deepEqual(terminalCalls, ['waitForExit', 'currentOutput', 'release'])
+})
+
 test('AgentSessionProcess: keeps native read/write/edit when the client does not advertise fs support', async () => {
   const fakeSession = new FakeAgentSession()
 

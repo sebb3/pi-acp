@@ -45,12 +45,14 @@ type CreateAgentSession = (options: Record<string, unknown>) => Promise<{ sessio
 type CreateReadToolDefinition = (cwd: string, options?: Record<string, unknown>) => AgentToolLike
 type CreateWriteToolDefinition = (cwd: string, options?: Record<string, unknown>) => AgentToolLike
 type CreateEditToolDefinition = (cwd: string, options?: Record<string, unknown>) => AgentToolLike
+type CreateBashToolDefinition = (cwd: string, options?: Record<string, unknown>) => AgentToolLike
 
 type PiSdkModule = {
   createAgentSession?: CreateAgentSession
   createReadToolDefinition?: CreateReadToolDefinition
   createWriteToolDefinition?: CreateWriteToolDefinition
   createEditToolDefinition?: CreateEditToolDefinition
+  createBashToolDefinition?: CreateBashToolDefinition
   SessionManager?: PiSessionManagerCtorLike
 }
 
@@ -59,6 +61,7 @@ type SpawnDeps = {
   createReadToolDefinition?: CreateReadToolDefinition
   createWriteToolDefinition?: CreateWriteToolDefinition
   createEditToolDefinition?: CreateEditToolDefinition
+  createBashToolDefinition?: CreateBashToolDefinition
 }
 
 type SpawnParams = {
@@ -87,6 +90,7 @@ export class AgentSessionProcess implements PiProcessLike {
     const createReadToolDefinition = deps.createReadToolDefinition ?? sdk?.createReadToolDefinition
     const createWriteToolDefinition = deps.createWriteToolDefinition ?? sdk?.createWriteToolDefinition
     const createEditToolDefinition = deps.createEditToolDefinition ?? sdk?.createEditToolDefinition
+    const createBashToolDefinition = deps.createBashToolDefinition ?? sdk?.createBashToolDefinition
     const sessionManager = params.sessionPath ? sdk?.SessionManager?.open(params.sessionPath, undefined, params.cwd) : undefined
     const sessionIdRef = { current: '' }
     const customTools: AgentToolLike[] = []
@@ -119,6 +123,17 @@ export class AgentSessionProcess implements PiProcessLike {
           cwd: params.cwd,
           conn: params.conn!,
           createEditToolDefinition,
+          getSessionId: () => sessionIdRef.current
+        })
+      )
+    }
+
+    if (createBashToolDefinition && shouldUseAcpTerminal(params)) {
+      customTools.push(
+        createAcpBashToolDefinition({
+          cwd: params.cwd,
+          conn: params.conn!,
+          createBashToolDefinition,
           getSessionId: () => sessionIdRef.current
         })
       )
@@ -299,6 +314,10 @@ function shouldUseAcpEdit(params: SpawnParams): boolean {
   return Boolean(params.conn && params.clientCapabilities?.fs?.readTextFile && params.clientCapabilities?.fs?.writeTextFile)
 }
 
+function shouldUseAcpTerminal(params: SpawnParams): boolean {
+  return Boolean(params.conn && params.clientCapabilities?.terminal)
+}
+
 function createAcpReadToolDefinition(opts: {
   cwd: string
   conn: AgentSideConnection
@@ -356,6 +375,94 @@ function createAcpEditToolDefinition(opts: {
       }
     }
   })
+}
+
+function createAcpBashToolDefinition(opts: {
+  cwd: string
+  conn: AgentSideConnection
+  createBashToolDefinition: CreateBashToolDefinition
+  getSessionId: () => string
+}): AgentToolLike {
+  return opts.createBashToolDefinition(opts.cwd, {
+    operations: {
+      exec: async (
+        command: string,
+        cwd: string,
+        options: { onData: (data: Buffer) => void; signal?: AbortSignal; timeout?: number; env?: NodeJS.ProcessEnv }
+      ) => runAcpTerminalCommand({ ...opts, command, cwd, options })
+    }
+  })
+}
+
+async function runAcpTerminalCommand(opts: {
+  conn: AgentSideConnection
+  getSessionId: () => string
+  command: string
+  cwd: string
+  options: { onData: (data: Buffer) => void; signal?: AbortSignal; timeout?: number; env?: NodeJS.ProcessEnv }
+}): Promise<{ exitCode: number | null }> {
+  if (opts.options.signal?.aborted) throw new Error('aborted')
+
+  const shell = process.env.SHELL || '/bin/bash'
+  const env = Object.entries(opts.options.env ?? {})
+    .filter((entry): entry is [string, string] => typeof entry[1] === 'string')
+    .map(([name, value]) => ({ name, value }))
+  const terminal = await opts.conn.createTerminal({
+    sessionId: opts.getSessionId(),
+    command: shell,
+    args: ['-lc', opts.command],
+    cwd: opts.cwd,
+    env,
+    outputByteLimit: 1024 * 1024
+  })
+
+  let lastOutput = ''
+  let finished = false
+  let timedOut = false
+  let timeoutHandle: NodeJS.Timeout | undefined
+
+  const emitOutputDelta = async () => {
+    const output = await terminal.currentOutput()
+    if (output.output.startsWith(lastOutput)) {
+      const delta = output.output.slice(lastOutput.length)
+      if (delta) opts.options.onData(Buffer.from(delta, 'utf8'))
+    } else if (output.output) {
+      opts.options.onData(Buffer.from(output.output, 'utf8'))
+    }
+    lastOutput = output.output
+  }
+
+  const interval = setInterval(() => {
+    if (!finished) emitOutputDelta().catch(() => undefined)
+  }, 100)
+  const abort = () => {
+    terminal.kill().catch(() => undefined)
+  }
+
+  try {
+    if (opts.options.timeout && opts.options.timeout > 0) {
+      timeoutHandle = setTimeout(() => {
+        timedOut = true
+        terminal.kill().catch(() => undefined)
+      }, opts.options.timeout * 1000)
+    }
+    opts.options.signal?.addEventListener('abort', abort, { once: true })
+
+    const exit = await terminal.waitForExit()
+    finished = true
+    await emitOutputDelta()
+
+    if (opts.options.signal?.aborted) throw new Error('aborted')
+    if (timedOut) throw new Error(`timeout:${opts.options.timeout}`)
+
+    return { exitCode: typeof exit.exitCode === 'number' ? exit.exitCode : null }
+  } finally {
+    finished = true
+    clearInterval(interval)
+    if (timeoutHandle) clearTimeout(timeoutHandle)
+    opts.options.signal?.removeEventListener('abort', abort)
+    await terminal.release().catch(() => undefined)
+  }
 }
 
 function installAcpTool(session: AgentSessionLike, acpTool: AgentToolLike): void {
